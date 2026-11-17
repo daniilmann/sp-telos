@@ -35,4 +35,6 @@ git -c core.hooksPath=/dev/null push ...
 
 ## Notes
 
-Plugin API types: npm 20.0.0 until the fork release package is available.
+Plugin API types: the package attached to the fork release the plugin targets
+(URL in package.json, integrity pinned in package-lock.json). Move to a new fork
+release by changing the URL and updating only that lockfile entry.
