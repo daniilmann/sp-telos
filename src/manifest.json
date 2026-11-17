@@ -1,0 +1,9 @@
+{
+  "id": "sp-telos",
+  "name": "SP Telos",
+  "manifestVersion": 1,
+  "minSupVersion": "20.0.0",
+  "description": "Goals and planning for Super Productivity.",
+  "iFrame": true,
+  "isSkipMenuEntry": true
+}

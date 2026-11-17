@@ -1,0 +1,33 @@
+{
+  "name": "sp-telos",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "npm@11.18.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit && tsc -p tests --noEmit",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "build": "node scripts/build.mjs",
+    "pack": "node scripts/pack.mjs",
+    "check:sh": "shellcheck server/*.sh && awk 'FNR == 1 { if (f != \"\" && n > 400) { print f \": \" n \" code lines (max 400)\"; bad = 1 } f = FILENAME; n = 0 } !/^[[:space:]]*(#|$)/ { n++ } END { if (n > 400) { print f \": \" n \" code lines (max 400)\"; bad = 1 } exit bad }' server/*.sh",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@super-productivity/plugin-api": "20.0.0",
+    "preact": "11.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "eslint": "9.39.4",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-sonarjs": "4.2.2",
+    "husky": "9.1.7",
+    "prettier": "3.8.3",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.1.0"
+  }
+}

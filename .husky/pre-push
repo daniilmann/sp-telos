@@ -1,0 +1,11 @@
+# Type checks always; unit tests for changes since main unless skipped by local git config.
+set -eu
+
+npx --no-install tsc --noEmit
+npx --no-install tsc -p tests --noEmit
+
+if [ "$(git config --get sptelos.skipPrePushTests || true)" = "true" ]; then
+  echo "pre-push: unit tests skipped (sptelos.skipPrePushTests=true)"
+else
+  npx --no-install vitest run --changed main
+fi

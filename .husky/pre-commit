@@ -1,0 +1,14 @@
+# Prettier and ESLint on staged files only.
+set -eu
+
+staged() {
+  git diff --cached --name-only --diff-filter=ACMR -z -- "$@"
+}
+
+if [ -n "$(staged | tr -d '\0')" ]; then
+  staged | xargs -0 npx --no-install prettier --check --ignore-unknown
+fi
+
+if [ -n "$(staged '*.ts' '*.tsx' '*.js' '*.mjs' | tr -d '\0')" ]; then
+  staged '*.ts' '*.tsx' '*.js' '*.mjs' | xargs -0 npx --no-install eslint --no-warn-ignored
+fi
