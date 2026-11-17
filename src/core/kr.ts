@@ -7,5 +7,5 @@ export interface KrDraft {
 
 export function getMissingKrFields(draft: KrDraft): (keyof KrDraft)[] {
   const requiredFields: (keyof KrDraft)[] = ['statement', 'baseline', 'dataSource', 'target'];
-  return requiredFields.filter((key) => draft[key] === '');
+  return requiredFields.filter((key) => draft[key].trim().length === 0);
 }
