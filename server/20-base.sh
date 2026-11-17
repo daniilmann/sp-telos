@@ -30,6 +30,7 @@ systemctl enable --now fail2ban >/dev/null; systemctl restart fail2ban
 install -m 0755 -d /etc/apt/keyrings
 [ -f /etc/apt/keyrings/docker.asc ] || curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
+# shellcheck source=/dev/null
 . /etc/os-release
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
 apt-get update -qq
