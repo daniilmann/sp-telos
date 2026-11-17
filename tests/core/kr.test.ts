@@ -37,6 +37,15 @@ describe('getMissingKrFields', () => {
     expect(getMissingKrFields(draft)).toEqual(['target']);
   });
 
+  it.each(['statement', 'baseline', 'dataSource', 'target'] as const)(
+    'A required field contains only spaces: %s',
+    (field) => {
+      const draft: KrDraft = { ...filledDraft, [field]: '   ' };
+
+      expect(getMissingKrFields(draft)).toEqual([field]);
+    },
+  );
+
   it('A filled field has surrounding spaces', () => {
     const draft: KrDraft = {
       statement: '  Reduce cycle time  ',
