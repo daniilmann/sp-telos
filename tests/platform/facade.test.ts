@@ -1,3 +1,5 @@
+import { build } from 'esbuild';
+import { Buffer } from 'node:buffer';
 import {
   isValidElement,
   toChildArray,
@@ -6,10 +8,13 @@ import {
   type VNode,
 } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createGoalEditor } from '../../src/app/goal-editor';
 import { applyPlan, EMPTY_STATE, type Plan, type PlanState } from '../../src/core/plan';
 import { canonicalJson, decodeRecord, MODEL_VERSION } from '../../src/core/records';
-import { createHostFacade } from '../../src/platform/facade';
+import { createDraftStore } from '../../src/platform/draft-store';
+import { createHostFacade, type PlanHandoff } from '../../src/platform/facade';
 import { GoalForm } from '../../src/ui/goals/GoalForm';
+import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
 import {
   createDeferred,
   createFakeHost,
@@ -19,13 +24,17 @@ import {
 } from '../fakes/fake-facade';
 import { input, openSaveStatusEditor } from '../fakes/save-status-editor';
 
-async function startHost(initial?: PlanState, hasSaveMethod = true) {
+async function startHost(
+  initial?: PlanState,
+  hasSaveMethod = true,
+  loadPlugin: () => Promise<unknown> = () => import('../../src/plugin'),
+) {
   const host = createFakeHost(initial);
   vi.stubGlobal('PluginAPI', {
     ...host.api,
     getSyncedDataSaveState: hasSaveMethod ? host.api.getSyncedDataSaveState : undefined,
   });
-  await import('../../src/plugin');
+  await loadPlugin();
   await host.ready();
   return {
     ...host,
@@ -302,6 +311,93 @@ it('paces two manual saves of the same key at the two-second boundary', async ()
   ]);
   const second = f.facade.apply.mock.lastCall![0].writes[0]!;
   expect(decodeRecord(second.key, second.value)).toMatchObject({ ok: true, value: latest.fields });
+});
+
+it('paces editor writes from the first host call after a queue delay', async () => {
+  vi.useFakeTimers({ now: 10_000 });
+  // Build plugin.js in memory so the test can run before the release build.
+  const plugin = await build({
+    entryPoints: ['src/plugin.ts'],
+    bundle: true,
+    format: 'iife',
+    target: 'es2020',
+    minify: true,
+    write: false,
+  });
+  const script = Buffer.from(plugin.outputFiles[0]!.contents).toString('base64');
+  const host = await startHost(
+    initial,
+    true,
+    () => import(`data:text/javascript;base64,${script}#${crypto.randomUUID()}`),
+  );
+  const form = createGoalEditor({
+    facade: {
+      ...createHostFacade(),
+      apply: (plan) => host.apply(plan) as Promise<PlanHandoff>,
+    },
+    drafts: createDraftStore(createFakeDraftDatabase().factory),
+    now: Date.now,
+    newId: () => crypto.randomUUID(),
+  });
+  await form.open(original.key);
+
+  const writeTimes: number[] = [];
+  host.beforeHandoff.mockImplementation((key) => {
+    if (key === original.key) writeTimes.push(Date.now());
+    return Promise.resolve();
+  });
+  const entered = createDeferred();
+  const release = createDeferred();
+  host.beforeHandoff.mockImplementationOnce(() => {
+    entered.resolve();
+    return release.promise;
+  });
+  const ahead = host.apply(manualPlan(goalWrite(2, 21)));
+  const latest = { ...input, fields: { statement: 'Следующее изменение' } };
+
+  try {
+    await Promise.race([entered.promise, ahead]);
+    expect(form.input(input)).toBe(true);
+    const firstSave = pressSave(form);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(host.deliver).toHaveBeenCalledWith({
+      cmd: 'apply',
+      plan: expect.objectContaining({ writes: [expect.objectContaining({ key: original.key })] }),
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(writeTimes).toEqual([]);
+    expect(form.input(latest)).toBe(true);
+
+    const firstWriteAt = Date.now();
+    release.resolve();
+    await ahead;
+    await firstSave;
+    await host.commitAfter(Promise.resolve());
+    expect(writeTimes).toEqual([firstWriteAt]);
+    expect(decodeRecord(original.key, host.committed().entries[original.key]!)).toMatchObject({
+      ok: true,
+      value: input.fields,
+    });
+    expect(form.view()).toMatchObject({ busy: false, intent: latest });
+
+    const secondSave = pressSave(form);
+    await vi.advanceTimersByTimeAsync(1999);
+    const beforeBoundary = [...writeTimes];
+    await vi.advanceTimersByTimeAsync(1);
+    expect({ beforeBoundary, atBoundary: writeTimes }).toEqual({
+      beforeBoundary: [firstWriteAt],
+      atBoundary: [firstWriteAt, firstWriteAt + 2000],
+    });
+    await secondSave;
+    await host.commitAfter(Promise.resolve());
+    expect(decodeRecord(original.key, host.committed().entries[original.key]!)).toMatchObject({
+      ok: true,
+      value: latest.fields,
+    });
+  } finally {
+    release.resolve();
+    form.close();
+  }
 });
 
 it.each([
