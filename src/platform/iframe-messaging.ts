@@ -1,11 +1,19 @@
 // Iframe side of the PLUGIN_MESSAGE bridge to plugin.js.
-import type { Command } from '../app/commands';
+import type { Command, CompatibilityQuery } from '../app/commands';
+import {
+  createHostFacade,
+  newId,
+  type Facade,
+  type PlanHandoff,
+  type ReadSnapshot,
+} from './facade';
 
-const TIMEOUT_MS = 30000;
+const TIMEOUT_MS = 30_000;
+const INCOMPLETE_MS = 60_000;
 
-interface Pending {
-  readonly resolve: (value: unknown) => void;
-  readonly reject: (error: Error) => void;
+interface SendOptions {
+  readonly onIncomplete?: (message: string) => void;
+  readonly onReread?: (snapshot: ReadSnapshot) => void;
 }
 
 interface Reply {
@@ -15,32 +23,78 @@ interface Reply {
   readonly error?: unknown;
 }
 
-let seq = 0;
-const pending = new Map<string, Pending>();
+const pending = new Map<string, (reply: Reply) => void>();
 
 window.addEventListener('message', (event: MessageEvent<Reply | null>) => {
   if (event.source !== window.parent) return;
   const data = event.data;
-  if (data === null || typeof data.messageId !== 'string') return;
-  const waiter = pending.get(data.messageId);
-  if (!waiter) return;
-  if (data.type === 'PLUGIN_MESSAGE_RESPONSE') {
-    pending.delete(data.messageId);
-    waiter.resolve(data.result);
-  } else if (data.type === 'PLUGIN_MESSAGE_ERROR') {
-    pending.delete(data.messageId);
-    waiter.reject(new Error(String(data.error)));
+  if (
+    !data ||
+    typeof data.messageId !== 'string' ||
+    (data.type !== 'PLUGIN_MESSAGE_RESPONSE' && data.type !== 'PLUGIN_MESSAGE_ERROR')
+  ) {
+    return;
   }
+  const complete = pending.get(data.messageId);
+  pending.delete(data.messageId);
+  complete?.(data);
 });
 
-export function send(message: Command): Promise<unknown> {
+export function send(message: Command, options?: SendOptions): Promise<PlanHandoff>;
+export function send(message: CompatibilityQuery): Promise<unknown>;
+export function send(
+  message: Command | CompatibilityQuery,
+  options: SendOptions = {},
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    seq += 1;
-    const messageId = `sp-telos-${String(seq)}`;
-    pending.set(messageId, { resolve, reject });
-    window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message }, '*');
-    setTimeout(() => {
-      if (pending.delete(messageId)) reject(new Error('No reply from plugin.js; state unknown.'));
+    const messageId = newId();
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      reject(new Error('Состояние неизвестно'));
+      if (message.cmd === 'apply') {
+        const keys = message.plan.writes.map(({ key }) => key);
+        void createHostFacade()
+          .read(keys)
+          .then(options.onReread)
+          .catch(() => {
+            // The outcome is still unknown if the read also fails.
+          });
+      } else {
+        pending.delete(messageId);
+      }
     }, TIMEOUT_MS);
+    const incomplete =
+      message.cmd === 'apply'
+        ? setTimeout(() => {
+            options.onIncomplete?.('Запись не завершена — перезапустите приложение');
+          }, INCOMPLETE_MS)
+        : undefined;
+
+    pending.set(messageId, (reply) => {
+      clearTimeout(deadline);
+      clearTimeout(incomplete);
+      if (timedOut) return;
+      if (reply.type === 'PLUGIN_MESSAGE_ERROR') {
+        reject(new Error(typeof reply.error === 'string' ? reply.error : 'Ошибка записи плана.'));
+      } else {
+        resolve(reply.result);
+      }
+    });
+    try {
+      window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message }, '*');
+    } catch (error) {
+      pending.delete(messageId);
+      clearTimeout(deadline);
+      clearTimeout(incomplete);
+      throw error;
+    }
   });
+}
+
+export function createIframeFacade(options: SendOptions) {
+  return {
+    ...createHostFacade(),
+    apply: (plan) => send({ cmd: 'apply', plan }, options),
+  } satisfies Facade<PlanHandoff>;
 }
