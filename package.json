@@ -13,13 +13,16 @@
     "build": "node scripts/build.mjs",
     "pack": "node scripts/pack.mjs",
     "check:sh": "shellcheck server/*.sh && awk 'FNR == 1 { if (f != \"\" && n > 400) { print f \": \" n \" code lines (max 400)\"; bad = 1 } f = FILENAME; n = 0 } !/^[[:space:]]*(#|$)/ { n++ } END { if (n > 400) { print f \": \" n \" code lines (max 400)\"; bad = 1 } exit bad }' server/*.sh",
-    "prepare": "husky"
+    "prepare": "husky",
+    "test:e2e": "playwright test -c tests/e2e/playwright.config.ts"
   },
   "dependencies": {
     "@super-productivity/plugin-api": "https://github.com/daniilmann/super-productivity/releases/download/v20.0.0-fork.4/super-productivity-plugin-api-20.0.0-fork.4.tgz",
     "preact": "11.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@types/node": "22.19.19",
     "esbuild": "0.28.2",
     "eslint": "9.39.4",
     "eslint-plugin-react-hooks": "7.1.1",

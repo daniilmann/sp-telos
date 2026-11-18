@@ -1,0 +1,50 @@
+name: sp-telos-e2e
+services:
+  db:
+    image: postgres:15-alpine
+    init: true
+    environment:
+      POSTGRES_USER: supersync
+      POSTGRES_PASSWORD: sp-telos-e2e-db
+      POSTGRES_DB: supersync_e2e
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U supersync -d supersync_e2e']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  supersync:
+    # Keep this reference identical to server/supersync-image.
+    image: ghcr.io/super-productivity/supersync:v20.0.0@sha256:4957b12b0ad032847bc0d326a739078e9029f274116478cafcbe948fc4fad910
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:47901:1900'
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /app/data:uid=1001,mode=0700
+    environment:
+      NODE_ENV: development
+      PORT: '1900'
+      TEST_MODE: 'true'
+      TEST_MODE_CONFIRM: yes-i-understand-the-risks
+      JWT_SECRET: ${SP_TELOS_E2E_JWT_SECRET:?generate a test-only JWT secret}
+      DATABASE_URL: postgresql://supersync:sp-telos-e2e-db@db:5432/supersync_e2e
+      RUN_MIGRATIONS_ON_STARTUP: 'true'
+      DATA_DIR: /app/data
+      WEBAUTHN_ORIGIN: http://127.0.0.1:47901
+      PUBLIC_URL: http://127.0.0.1:47901
+      CORS_ORIGINS: http://127.0.0.1:47173
+    healthcheck:
+      test: ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1:1900/health']
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
