@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { applyPlan } from '../../src/core/plan';
 import { decodeRecord } from '../../src/core/records';
 import {
-  blockBackgroundSync,
   button,
   committedWrite,
   confirm,
@@ -19,6 +18,7 @@ import {
   pressEnter,
   pull,
   receipt,
+  reopenOffline,
   saved,
   setOffline,
   snapshot,
@@ -113,9 +113,9 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await statement(a.frame).fill(newestInput);
   await a.page.close();
 
-  const page = await a.context.newPage();
-  await blockBackgroundSync(page);
-  const reopened = { ...a, page, frame: await stand.openPlugin(page) };
+  const reopened = await reopenOffline(a, stand);
+  const { page } = reopened;
+  await expect.poll(() => page.evaluate(() => navigator.onLine)).toBe(false);
   const persisted = await draft(form(reopened), offline.key);
   const restoredInput = persisted?.fields.statement;
   if (restoredInput !== previousInput && restoredInput !== newestInput)

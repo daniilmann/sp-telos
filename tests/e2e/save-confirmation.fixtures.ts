@@ -4,7 +4,7 @@ import type { BrowserContext, FrameLocator, Locator, Page, Response } from '@pla
 import { buildPlan, isPlan, type Plan } from '../../src/core/plan';
 import { RECORD_PREFIXES } from '../../src/core/records';
 import type { Draft } from '../../src/platform/draft-store';
-import { expect, isSyncOps, test, type Stand, type StandProfile } from './stand';
+import { expect, isSyncOps, SYNC_ORIGIN, test, type Stand, type StandProfile } from './stand';
 
 export const saved = /^Сохранено в (?:[01]\d|2[0-3]):[0-5]\d$/;
 const partitions = new WeakSet<BrowserContext>();
@@ -20,10 +20,7 @@ export async function pair(stand: Stand) {
     const profile = await stand.newProfile();
     const { context } = profile;
     await context.routeWebSocket('ws://127.0.0.1:47901/**', (socket) => {
-      if (partitions.has(context)) {
-        void socket.close();
-        return;
-      }
+      if (partitions.has(context)) return void socket.close();
       const server = socket.connectToServer();
       socket.onMessage((message) => {
         if (!partitions.has(context)) server.send(message);
@@ -49,9 +46,7 @@ export function status(body: Locator, keys: string[]) {
   return body.evaluate((_body, ids) => PluginAPI.getSyncedDataSaveState(ids), keys);
 }
 
-export async function sync(body: Locator) {
-  await body.evaluate(() => PluginAPI.triggerSync());
-}
+export const sync = (body: Locator) => body.evaluate(() => PluginAPI.triggerSync());
 
 export const digest = (raw: string) => createHash('sha256').update(raw, 'utf8').digest('hex');
 export function receipt(raw: string) {
@@ -341,32 +336,38 @@ export const makePlan = (inputs: Parameters<typeof buildPlan>[1]) =>
 const browserOnline = (page: Page) => page.evaluate(() => navigator.onLine);
 
 export async function setOffline(profile: StandProfile) {
-  const assets = new URL(profile.page.url()).origin + '/**';
-  await profile.context.route(assets, async (route) => {
-    // Fetch real loopback assets through Playwright while the browser transport is offline.
-    await route.fulfill({ response: await route.fetch({ maxRedirects: 0 }) });
-  });
   partitions.add(profile.context);
   await profile.context.setOffline(true);
   await expect.poll(() => browserOnline(profile.page)).toBe(false);
   return async (page = profile.page) => {
-    await profile.context.unroute(assets);
     await profile.context.setOffline(false);
     partitions.delete(profile.context);
     await expect.poll(() => browserOnline(page)).toBe(true);
   };
 }
 
-export function blockBackgroundSync(page: Page) {
-  // Use the same scheduler gates as the pinned fork's E2E suite.
-  return page.addInitScript(() => {
-    if (window !== window.top) return;
-    Object.assign(globalThis, {
-      __SP_E2E_BLOCK_AUTO_SYNC: true,
-      __SP_E2E_BLOCK_WS_DOWNLOAD: true,
-      __SP_E2E_BLOCK_IMMEDIATE_UPLOAD: true,
+export async function reopenOffline({ context }: StandProfile, stand: Stand) {
+  const syncRequests = SYNC_ORIGIN + '/**';
+  const abort = (route: import('@playwright/test').Route) => route.abort('internetdisconnected');
+  await context.route(syncRequests, abort);
+  try {
+    // Let Chromium load the document natively while the WebSocket partition and HTTP block hold.
+    await context.setOffline(false);
+    const page = await context.newPage();
+    // Use the same scheduler gates as the pinned fork's E2E suite.
+    await page.addInitScript(() => {
+      if (window !== window.top) return;
+      Object.assign(globalThis, {
+        __SP_E2E_BLOCK_AUTO_SYNC: true,
+        __SP_E2E_BLOCK_WS_DOWNLOAD: true,
+        __SP_E2E_BLOCK_IMMEDIATE_UPLOAD: true,
+      });
     });
-  });
+    return { context, page, frame: await stand.openPlugin(page) };
+  } finally {
+    await context.setOffline(true);
+    await context.unroute(syncRequests, abort);
+  }
 }
 
 type SyncOperation = { id: string; clientId: string; isPayloadEncrypted: boolean };
