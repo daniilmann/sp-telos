@@ -1,5 +1,5 @@
 // Iframe side of the PLUGIN_MESSAGE bridge to plugin.js.
-import type { Command, CompatibilityQuery } from '../app/commands';
+import type { ApplyingQuery, Command, CompatibilityQuery } from '../app/commands';
 import {
   createHostFacade,
   newId,
@@ -46,6 +46,13 @@ export function send(
   message: Command | CompatibilityQuery,
   options: SendOptions = {},
 ): Promise<unknown> {
+  return sendRequest(message, options);
+}
+
+function sendRequest(
+  message: Command | CompatibilityQuery | ApplyingQuery,
+  options: SendOptions = {},
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const messageId = newId();
     let timedOut = false;
@@ -67,7 +74,18 @@ export function send(
     const incomplete =
       message.cmd === 'apply'
         ? setTimeout(() => {
-            options.onIncomplete?.('Запись не завершена — перезапустите приложение');
+            pending.delete(messageId);
+            const { onIncomplete } = options;
+            if (onIncomplete === undefined) return;
+            void sendRequest({ cmd: 'isApplying', requestId: messageId }).then(
+              (isApplying) => {
+                if (isApplying === true)
+                  onIncomplete('Запись не завершена — перезапустите приложение');
+              },
+              () => {
+                // The outcome is still unknown if the status request fails.
+              },
+            );
           }, INCOMPLETE_MS)
         : undefined;
 
@@ -82,7 +100,8 @@ export function send(
       }
     });
     try {
-      window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message }, '*');
+      const body = message.cmd === 'apply' ? { ...message, requestId: messageId } : message;
+      window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message: body }, '*');
     } catch (error) {
       pending.delete(messageId);
       clearTimeout(deadline);
