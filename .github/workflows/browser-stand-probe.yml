@@ -1,0 +1,133 @@
+name: Browser stand probe
+
+on:
+  push:
+    branches: [codex/s10-browser-probe]
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  FORK_SHA: aab7f62ec24206e378595b2b82d9764d204504d7
+  PLUGIN_SHA: ee9758311f12a5bed74285f6c0a401540d069a59
+  TYPES_RUN_ID: '44329171660'
+  TYPES_ARTIFACT_ID: '14439250082'
+  TYPES_SHA256: 5856e5dd5157f651cf63ddc530deb14e2a51d4adcd702bc011409a631757193f
+  HUSKY: '0'
+
+jobs:
+  browser:
+    name: Browser stand with SuperSync
+    if: github.ref == 'refs/heads/codex/s10-browser-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 33
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: daniilmann/super-productivity
+          ref: ${{ env.FORK_SHA }}
+          path: fork-src
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.PLUGIN_SHA }}
+          path: plugin-src
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: fork-src/.nvmrc
+      - name: Verify both source revisions and set up npm
+        run: |
+          set -euo pipefail
+          [[ $(git -C fork-src rev-parse HEAD) == "$FORK_SHA" ]]
+          [[ $(git -C plugin-src rev-parse HEAD) == "$PLUGIN_SHA" ]]
+          npm_dir="$RUNNER_TEMP/npm-11.18.0"
+          mkdir -p "$npm_dir/shims"
+          archive="$npm_dir/npm.tgz"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --output "$archive" https://registry.npmjs.org/npm/-/npm-11.18.0.tgz
+          printf '%s  %s\n' \
+            '4faecce0be70366d1c67b1012c4adc1246354a6cc45bf589f92003073b05518d547403df1475c542d67a4845e22b4fafcd7cac0af02c7a96cc6814f09eb003fb' \
+            "$archive" | sha512sum --check -
+          tar -xzf "$archive" -C "$npm_dir" --strip-components=1
+          ln -s "$npm_dir/bin/npm-cli.js" "$npm_dir/shims/npm"
+          ln -s "$npm_dir/bin/npx-cli.js" "$npm_dir/shims/npx"
+          printf '%s\n' "$npm_dir/shims" >> "$GITHUB_PATH"
+      - name: Build the fork web application
+        working-directory: fork-src
+        run: |
+          set -euo pipefail
+          npm ci --min-release-age=3
+          npm run buildFrontend:e2e
+          web_root="$PWD/.tmp/angular-dist/browser"
+          test -s "$web_root/index.html"
+          sha256sum "$web_root/index.html"
+          printf 'SP_TELOS_E2E_WEB_DIR=%s\n' "$web_root" >> "$GITHUB_ENV"
+      - name: Download verified branch types
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/e2e-types"
+          mkdir -p "$root"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$TYPES_ARTIFACT_ID" > "$root/artifact.json"
+          jq -e --argjson run "$TYPES_RUN_ID" --argjson id "$TYPES_ARTIFACT_ID" \
+            '.id == $id and .workflow_run.id == $run and (.expired | not)' "$root/artifact.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$TYPES_ARTIFACT_ID/zip" > "$root/artifact.zip"
+          unzip -p "$root/artifact.zip" plugin-api.tgz > "$root/plugin-api.tgz"
+          printf '%s  %s\n' "$TYPES_SHA256" "$root/plugin-api.tgz" | sha256sum --check -
+          printf 'TELOS_E2E_TYPES_TGZ=%s\n' "$root/plugin-api.tgz" >> "$GITHUB_ENV"
+      - name: Build the plugin package and prepare Chromium
+        working-directory: plugin-src
+        run: |
+          set -euo pipefail
+          npm ci --min-release-age=3
+          package_path=node_modules/@super-productivity/plugin-api
+          mkdir "$RUNNER_TEMP/release-types-original"
+          mv "$package_path" "$RUNNER_TEMP/release-types-original/plugin-api"
+          mkdir "$package_path"
+          tar -xzf "$TELOS_E2E_TYPES_TGZ" -C "$package_path" --strip-components=1
+          grep -E '^[[:space:]]+getSyncedDataSaveState\(' "$package_path/dist/"*.d.ts
+          npm run typecheck
+          npm run build
+          npm run pack
+          sha256sum sp-telos.zip
+          printf 'SP_TELOS_E2E_PLUGIN_ZIP=%s\n' "$PWD/sp-telos.zip" >> "$GITHUB_ENV"
+          npx --no-install playwright install --with-deps chromium
+      - name: Run browser tests
+        working-directory: plugin-src
+        run: |
+          set -euo pipefail
+          export SP_TELOS_E2E_JWT_SECRET
+          SP_TELOS_E2E_JWT_SECRET=$(openssl rand -hex 32)
+          image=$(cat server/supersync-image)
+          docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml config --images | grep -Fx -- "$image"
+          docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml up -d --wait
+          cat > tests/e2e/stand-preflight.spec.ts <<'TS'
+          import { expect, test } from './stand';
+          test('two isolated profiles connect to SuperSync and load the candidate ZIP', async ({ stand }) => {
+            const first = await stand.newProfile();
+            const second = await stand.newProfile();
+            expect(first.context).not.toBe(second.context);
+            await stand.connectSync(first);
+            await stand.connectSync(second);
+            for (const profile of [first, second]) {
+              await expect(profile.frame.getByRole('heading', { name: 'Цели и результаты' })).toBeVisible();
+              const reply = await profile.frame.locator('body').evaluate(async () =>
+                window.PluginAPI.getSyncedDataSaveState(['preflight:empty']),
+              );
+              expect(reply.sync).toBe('ok');
+              expect(reply.keys).toEqual({ 'preflight:empty': { state: 'unknown' } });
+            }
+          });
+          TS
+          npx --no-install playwright test -c tests/e2e/playwright.config.ts --list
+          npx --no-install playwright test -c tests/e2e/playwright.config.ts
+      - name: Stop the isolated test stack
+        if: always()
+        working-directory: plugin-src
+        run: |
+          export SP_TELOS_E2E_JWT_SECRET
+          SP_TELOS_E2E_JWT_SECRET=$(openssl rand -hex 32)
+          docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml down
