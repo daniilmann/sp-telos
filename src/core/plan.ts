@@ -166,13 +166,15 @@ export function classifyPlan(state: PlanState, plan: Plan): Classification {
 
     const target = decodeRecord(write.key, write.value);
     if (!target.ok) return target;
-    if (write.value !== canonicalJson(target.value)) return { ok: false, reason: 'invalid' };
     if (versions.has(target.value.ver)) return { ok: false, reason: 'invalid' };
     versions.add(target.value.ver);
 
     const classified = classifyWrite(state, plan.origin, write, target.value);
+    if (classified !== 'write' && classified !== 'replay') {
+      return { ok: false, reason: classified };
+    }
+    if (write.value !== canonicalJson(target.value)) return { ok: false, reason: 'invalid' };
     if (classified === 'write') writes.push(write);
-    else if (classified !== 'replay') return { ok: false, reason: classified };
   }
   return { ok: true, writes };
 }
