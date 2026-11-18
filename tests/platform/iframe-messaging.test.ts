@@ -12,7 +12,7 @@ import {
 type Request = {
   readonly type: 'PLUGIN_MESSAGE';
   readonly messageId: string;
-  readonly message: Command;
+  readonly message: Command | { readonly cmd: 'isApplying'; readonly requestId: string };
 };
 type Reply =
   | {
@@ -48,7 +48,10 @@ function createBridge(host: Awaited<ReturnType<typeof startHost>>) {
       currentWindow = undefined;
       generation += 1;
     },
-    async open(iframeWindow = {}) {
+    async open(
+      iframeWindow = {},
+      dropReply?: (answer: Reply, message: Request['message']) => boolean,
+    ) {
       // A new document runs its own copy of iframe-messaging, even if WindowProxy is reused.
       vi.resetModules();
       currentWindow = iframeWindow;
@@ -82,7 +85,7 @@ function createBridge(host: Awaited<ReturnType<typeof startHost>>) {
         );
         // Legacy PLUGIN_MESSAGE replies are addressed to event.source. A closed
         // document cannot receive them.
-        if (source === currentWindow) reply(answer);
+        if (source === currentWindow && !dropReply?.(answer, data.message)) reply(answer);
       };
       vi.stubGlobal('window', {
         parent: hostWindow,
@@ -257,6 +260,7 @@ it('reports a plan still incomplete after 60 seconds', async () => {
   const { entered, release } = holdFirstWrite(host);
   const onIncomplete = vi.fn<(message: string) => void>();
   const first = view.send(command(), { onIncomplete });
+  const [firstWire] = view.postMessage.mock.calls[0]!;
   const firstResult = first.catch((error: unknown) => error);
   try {
     await Promise.race([entered.promise, first]);
@@ -268,6 +272,7 @@ it('reports a plan still incomplete after 60 seconds', async () => {
 
     await vi.advanceTimersByTimeAsync(1);
     const second = view.send(command(next));
+    const [secondWire] = view.postMessage.mock.calls[1]!;
     const secondResult = second.catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(29_998);
     expect(onIncomplete).not.toHaveBeenCalled();
@@ -275,7 +280,9 @@ it('reports a plan still incomplete after 60 seconds', async () => {
     expect(onIncomplete).toHaveBeenCalledExactlyOnceWith(
       'Запись не завершена — перезапустите приложение',
     );
-    expect(view.reply).not.toHaveBeenCalled();
+    const replyIds = view.reply.mock.calls.map(([reply]) => reply.messageId);
+    expect(replyIds).not.toContain(firstWire.messageId);
+    expect(replyIds).not.toContain(secondWire.messageId);
     expect(host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(edit.value, edit.key);
     release.resolve();
     await Promise.all(view.deliveries);
@@ -285,6 +292,51 @@ it('reports a plan still incomplete after 60 seconds', async () => {
       [edit.value, edit.key],
       [next.value, next.key],
     ]);
+  } finally {
+    release.resolve();
+  }
+});
+
+it('does not report a completed plan as incomplete when its reply is lost', async () => {
+  const host = await startHost();
+  const dropReply = vi.fn((_answer: Reply, message: Request['message']) => message.cmd === 'apply');
+  const view = await createBridge(host).open({}, dropReply);
+  const { entered, release } = holdFirstWrite(host);
+  const onIncomplete = vi.fn<(message: string) => void>();
+  const onReread = vi.fn();
+  const first = view.send(command(), { onIncomplete, onReread });
+  const [applyWire] = view.postMessage.mock.calls[0]!;
+  const applyId = applyWire.messageId;
+  const firstResult = first.catch((error: unknown) => error);
+  try {
+    await Promise.race([entered.promise, first]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const unknownOutcome = expect.objectContaining({
+      message: expect.stringMatching(/unknown|неизвест/i),
+    });
+    expect(await firstResult).toEqual(unknownOutcome);
+    expect(onReread).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(initial));
+    expect(onIncomplete).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    release.resolve();
+    await host.commitAfter(view.deliveries[0]!);
+    expect(host.committed()).toEqual(applyPlan(initial, command().plan));
+    expect(dropReply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ type: 'PLUGIN_MESSAGE_RESPONSE', messageId: applyId }),
+      applyWire.message,
+    );
+    expect(view.reply).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(onIncomplete).not.toHaveBeenCalled();
+    expect(await firstResult).toEqual(unknownOutcome);
+    expect(applyWire.message).toMatchObject({ cmd: 'apply', requestId: applyId });
+    const [statusWire] = view.postMessage.mock.calls[1]!;
+    expect(statusWire.message).toEqual({ cmd: 'isApplying', requestId: applyId });
+    expect(view.reply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ type: 'PLUGIN_MESSAGE_RESPONSE', messageId: statusWire.messageId }),
+    );
   } finally {
     release.resolve();
   }
