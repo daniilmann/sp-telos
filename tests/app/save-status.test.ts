@@ -1,13 +1,9 @@
 import type { SaveState } from '@super-productivity/plugin-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSaveStatus } from '../../src/app/save-status';
-import { createGoalEditor } from '../../src/app/goal-editor';
 import { applyPlan, EMPTY_STATE, type Plan } from '../../src/core/plan';
 import { canonicalJson } from '../../src/core/records';
-import { createDraftStore } from '../../src/platform/draft-store';
-import { createHostFacade, inspectRecords } from '../../src/platform/facade';
-import { apply, checkCompatibility } from '../../src/platform/sp-facade';
-import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
+import { createHostFacade } from '../../src/platform/facade';
 import {
   createDeferred,
   createFakeHost,
@@ -15,6 +11,7 @@ import {
   manualPlan,
   versionOf,
 } from '../fakes/fake-facade';
+import { input, openSaveStatusEditor } from '../fakes/save-status-editor';
 
 const a = goalWrite(1, 11);
 const b = goalWrite(1, 12, versionOf(a));
@@ -248,48 +245,7 @@ describe('New input or closing the view invalidates a delayed reply', () => {
   );
 });
 
-async function editorFixture() {
-  const host = createFakeHost(initial);
-  const database = createFakeDraftDatabase();
-  const drafts = createDraftStore(database.factory);
-  vi.stubGlobal('PluginAPI', host.api);
-  const facade = {
-    ...createHostFacade(),
-    apply: vi.fn(apply),
-    async read() {
-      const { state, readOnlyReason } = await checkCompatibility([a.key]);
-      return { ...inspectRecords(state), ...(readOnlyReason && { readOnlyReason }) };
-    },
-  };
-  const form = createGoalEditor({
-    facade,
-    drafts,
-    now: Date.now,
-    newId: () => crypto.randomUUID(),
-  });
-  await form.open(a.key);
-  async function commitDrafts() {
-    await advance(0);
-    for (const transaction of database.mutations) {
-      if (transaction.finished) continue;
-      transaction.succeedRequest();
-      transaction.complete();
-      await advance(0);
-    }
-  }
-  async function submit() {
-    form.input(input);
-    await commitDrafts();
-    await form.save();
-    await host.commitAfter(Promise.resolve());
-    host.acknowledge(a.key, savedAt);
-    return host.api.getSyncedDataSaveState([a.key]);
-  }
-  const disk = () => database.committedRows('sp-telos-drafts').get(a.key);
-  return { host, facade, form, database, commitDrafts, submit, disk };
-}
-
-const input = { action: 'edit', fields: { statement: 'Локальный ввод' } } as const;
+const editorFixture = () => openSaveStatusEditor(initial, a.key, savedAt);
 const newInput = { ...input, fields: { statement: 'Текст после запроса' } };
 const savedMessage = /^Сохранено в /;
 
@@ -393,6 +349,53 @@ describe('Import revokes confirmation for identical data', () => {
     expect(f.form.view().message).toBe('Сохраняется…');
     await f.commitDrafts();
     expect(f.disk()).toMatchObject({ fields: input.fields });
+  });
+
+  async function abortCleanupAfterImport() {
+    const f = await editorFixture();
+    const confirmed = await f.submit();
+    await f.commitDrafts();
+    const draft = f.disk();
+    expect(draft).toMatchObject({ fields: input.fields });
+    const imported = f.host.committed().entries[a.key]!;
+    const polls = f.host.api.getSyncedDataSaveState;
+    polls
+      .mockClear()
+      .mockResolvedValueOnce(confirmed)
+      .mockResolvedValue(keyState({ state: 'unknown' }));
+
+    await advance(1000);
+    expect(f.form.view().message).toMatch(savedMessage);
+    const active = f.database.mutations.filter((tx) => !tx.finished);
+    expect(active).toHaveLength(1);
+    const deletion = active[0]!;
+    deletion.succeedRequest();
+
+    f.host.receiveSync(a.key, imported);
+    // The next poll and the cleanup flush deadline both arrive before the abort event.
+    await advance(5000);
+    expect(polls).toHaveBeenCalledTimes(2);
+    expect(f.form.view().message).toBe('Сохраняется…');
+    expect(deletion.finished).toBe(false);
+    deletion.abort();
+    await advance(0);
+    expect(f.disk()).toEqual(draft);
+    return { f, draft };
+  }
+
+  it('does not retry a failed cleanup after the first poll following import', async () => {
+    const { f, draft } = await abortCleanupAfterImport();
+    const leaving = f.form.leave();
+    await f.commitDrafts();
+    await leaving;
+    expect(f.disk()).toEqual(draft);
+  });
+
+  it('allows explicit discard after an aborted cleanup following import', async () => {
+    const { f } = await abortCleanupAfterImport();
+    expect(await f.form.leave('discard')).toBe(true);
+    await f.commitDrafts();
+    expect(f.disk()).toBeUndefined();
   });
 });
 
