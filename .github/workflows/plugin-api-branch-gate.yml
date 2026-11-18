@@ -312,6 +312,10 @@ jobs:
             grep -Fx "$installed/dist/types.d.ts" "$trace" &&
             grep -E '^[[:space:]]+getSyncedDataSaveState\(' "$installed/dist/types.d.ts"
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Restore release dependency manifests
+        run: |
+          git restore --source="$GITHUB_SHA" -- package.json package-lock.json
+          git diff --exit-code HEAD -- package.json package-lock.json
       - run: npm run lint
       - run: npm run format:check
       - run: TZ=Europe/Moscow npm test
