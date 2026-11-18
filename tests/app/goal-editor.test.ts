@@ -1,3 +1,4 @@
+import { setTimeout as realDelay } from 'node:timers/promises';
 import type { SaveState } from '@super-productivity/plugin-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createGoalEditor } from '../../src/app/goal-editor';
@@ -169,8 +170,11 @@ it('Save validated text during editing', async () => {
   await poll(2000);
   const first = f.lastPlan().writes[0]!;
   expect(first).toMatchObject({ key: newGoalKey, base: 'absent' });
-  const firstAt = body(first.key, first.value).at;
-  expect(body(first.key, first.value)).toMatchObject({ statement: 'Начало' });
+  const firstValue = body(first.key, first.value);
+  expect(firstValue).toMatchObject({ statement: 'Начало' });
+  // Wait for the real WebCrypto work without advancing the auto-save clock.
+  const signal = AbortSignal.timeout(1000);
+  while (form.view().busy) await realDelay(1, undefined, { signal });
   input('Дальше');
   await poll(999);
   input('Последнее валидное поле');
@@ -182,7 +186,7 @@ it('Save validated text during editing', async () => {
   expect(second.base).toBe(versionOf(first));
   const secondValue = body(second.key, second.value);
   expect(secondValue).toMatchObject({ statement: 'Последнее валидное поле' });
-  expect(secondValue.at - firstAt).toBeGreaterThanOrEqual(2000);
+  expect(secondValue.at - firstValue.at).toBeGreaterThanOrEqual(2000);
 });
 
 describe('retries an already applied revision without duplicating history', () => {
