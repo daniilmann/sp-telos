@@ -1,4 +1,4 @@
-name: Diagnose offline retry on the same candidate
+name: Identify the host branch that skipped retry upload
 
 on:
   push:
@@ -114,6 +114,7 @@ jobs:
           python3 - "$output" <<'PYTHON'
           import json
           import pathlib
+          import re
           import sys
           import zipfile
           from urllib.parse import urlsplit
@@ -130,6 +131,14 @@ jobs:
               'host-invalid-provider': 'Provider does not support operation sync',
               'operation-upload': 'uploadOps',
               'fetch-failure': 'Failed to fetch',
+              'no-pending-operations': 'No pending operations to upload',
+              'mandatory-encryption-key-missing': 'Encryption is mandatory for this provider but no key is configured yet',
+              'download-skipped-upload': 'Skipping upload phase',
+              'download-blocked': 'Download blocked by an incompatible operation',
+              'upload-rejected-full-state': 'Upload remains blocked because rejected',
+              'encryption-password-required': 'DecryptNoPasswordError',
+              'auth-failure': 'AuthFailSPError',
+              'sync-complete': 'Sync complete, status=IN_SYNC',
               'browser-offline': 'ERR_INTERNET_DISCONNECTED',
               'provider-offline': 'temporary network problem',
           }
@@ -152,14 +161,21 @@ jobs:
                           for label, pattern in patterns.items():
                               if pattern in message:
                                   found.append((event.get('time', 0), label))
+                          download = re.search(r'Download complete\. kind=([a-z_]+)', message)
+                          if download and download[1] in ('no_new_ops', 'ops_processed', 'cancelled', 'server_migration_handled', 'server_migration_skipped', 'blocked_incompatible', 'snapshot_hydrated'):
+                              found.append((event.get('time', 0), 'download-outcome ' + download[1]))
+                          upload = re.search(r'Upload complete\. uploaded=(\d+), piggybacked=(\d+)', message)
+                          if upload:
+                              found.append((event.get('time', 0), 'uploaded ' + str(int(upload[1])) + ' piggybacked ' + str(int(upload[2]))))
                       if kind == 'resource-snapshot':
                           request = event.get('snapshot', {}).get('request', {})
                           url = urlsplit(request.get('url', ''))
-                          if url.hostname == '127.0.0.1' and url.port == 47901 and url.path == '/api/sync/ops':
+                          if url.hostname == '127.0.0.1' and url.port == 47901 and url.path in ('/api/sync/ops', '/api/sync/snapshot'):
                               tick = event['snapshot'].get('_monotonicTime', 0)
                               method = request.get('method')
-                              if method in ('GET', 'POST'):
-                                  found.append((tick, f'SuperSync {method}'))
+                              status = event['snapshot'].get('response', {}).get('status')
+                              if method in ('GET', 'POST') and isinstance(status, int):
+                                  found.append((tick, f'SuperSync {method} {url.path} HTTP {status}'))
           print(f'Retry test-step marker: {retry is not None}')
           for tick, label in sorted(found):
               if retry is None or not tick:
