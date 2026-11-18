@@ -3,9 +3,20 @@ name: gate
 on:
   push:
   workflow_dispatch:
+    inputs:
+      fork_tag:
+        description: Published fork tag for a compatibility run
+        type: string
+      plugin_tag:
+        description: Published plugin tag for the same compatibility run
+        type: string
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 env:
   HUSKY: '0'
@@ -16,31 +27,59 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
-          cache: npm
-      - run: npm install -g npm@11.18.0
+          package-manager-cache: false
+      - name: Set up checksum-verified npm 11.18.0
+        run: &verified-npm |
+          set -euo pipefail
+          npm_dir="$RUNNER_TEMP/npm-11.18.0"
+          mkdir "$npm_dir"
+          archive="$npm_dir/npm.tgz"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --output "$archive" https://registry.npmjs.org/npm/-/npm-11.18.0.tgz
+          printf '%s  %s\n' \
+            '4faecce0be70366d1c67b1012c4adc1246354a6cc45bf589f92003073b05518d547403df1475c542d67a4845e22b4fafcd7cac0af02c7a96cc6814f09eb003fb' \
+            "$archive" | sha512sum --check -
+          tar -xzf "$archive" -C "$npm_dir" --strip-components=1
+          mkdir "$npm_dir/shims"
+          ln -s "$npm_dir/bin/npm-cli.js" "$npm_dir/shims/npm"
+          ln -s "$npm_dir/bin/npx-cli.js" "$npm_dir/shims/npx"
+          printf '%s\n' "$npm_dir/shims" >> "$GITHUB_PATH"
       - run: npm ci
       - run: npm run lint
       - run: npm run format:check
+      - name: Audit the workflow offline with zizmor
+        run: |
+          set -euo pipefail
+          zizmor_dir="$(mktemp -d "$RUNNER_TEMP/zizmor.XXXXXX")"
+          archive="$zizmor_dir/zizmor.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --output "$archive" https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            'd185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99' \
+            "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$zizmor_dir" zizmor
+          env -u GH_TOKEN -u GITHUB_TOKEN "$zizmor_dir/zizmor" --offline --format=github \
+            .github/workflows/gate.yml
 
   types:
     name: Type check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
-          cache: npm
-      - run: npm install -g npm@11.18.0
+          package-manager-cache: false
+      - run: *verified-npm
       - run: npm ci
       - run: npm run typecheck
 
@@ -55,14 +94,14 @@ jobs:
     env:
       TZ: ${{ matrix.tz }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
-          cache: npm
-      - run: npm install -g npm@11.18.0
+          package-manager-cache: false
+      - run: *verified-npm
       - run: npm ci
       - run: npm test
 
@@ -70,28 +109,52 @@ jobs:
     name: Bundle and package
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      sha: ${{ steps.zip.outputs.sha }}
+      zip-sha256: ${{ steps.zip.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
-          cache: npm
-      - run: npm install -g npm@11.18.0
+          package-manager-cache: false
+      - run: *verified-npm
       - run: npm ci
       - run: npm run build
       - run: npm run pack
+      - name: Record the packaged ZIP
+        id: zip
+        run: |
+          sha="$(git rev-parse HEAD)"
+          test "$sha" = "$GITHUB_SHA"
+          digest="$(sha256sum < sp-telos.zip)"
+          printf 'sha=%s\nsha256=%s\n' "$sha" "${digest%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: >-
+          (github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+           github.ref_type == 'tag' && github.event.created && !github.event.deleted && !github.event.forced) ||
+          (github.event_name == 'workflow_dispatch' && inputs.plugin_tag == '' && inputs.fork_tag == '')
+        id: upload
+        with:
+          name: plugin-zip-${{ github.run_attempt }}
+          path: sp-telos.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
   server:
     name: Server scripts
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
       # shellcheck, then one awk pass: at most 400 code lines per script
@@ -109,6 +172,371 @@ jobs:
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           echo "results: $RESULTS"
-          for r in $RESULTS; do
+          read -r -a results <<< "$RESULTS"
+          test "${#results[@]}" -eq 5
+          for r in "${results[@]}"; do
             [ "$r" = success ] || { echo "::error::a gate job finished with result: $r"; exit 1; }
           done
+
+  release-tag:
+    name: Verify new release tag
+    if: >-
+      github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+      github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      oid: ${{ steps.tag.outputs.oid }}
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - name: Check the pushed tag object and commit
+        id: tag
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/tags/$GITHUB_REF_NAME" &&
+             "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+            { echo 'Expected a numeric plugin release tag.' >&2; exit 1; }
+          TAG_OID="$(jq -er --arg ref "$GITHUB_REF" '
+            select(.ref == $ref and .created == true and .deleted == false and .forced == false
+              and .before == "0000000000000000000000000000000000000000")
+            | .after | select(test("^[a-f0-9]{40}$"))' "$GITHUB_EVENT_PATH")" ||
+            { echo 'The push must create a new tag.' >&2; exit 1; }
+          remote="$(git ls-remote --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_REF" "$GITHUB_REF^{}")"
+          verify_tag() {
+            local direct peeled
+            direct="$(awk -v ref="$GITHUB_REF" '$2 == ref {print $1}' <<< "$1")"
+            peeled="$(awk -v ref="$GITHUB_REF^{}" '$2 == ref {print $1}' <<< "$1")"
+            [[ "$direct" == "$TAG_OID" && "${peeled:-$direct}" == "$GITHUB_SHA" ]]
+          }
+          verify_tag "$remote" || { echo 'The tag object or target changed.' >&2; exit 1; }
+          if [[ "$TAG_OID" != "$GITHUB_SHA" ]]; then
+            curl --disable --fail --silent --show-error --max-time 30 \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$TAG_OID" |
+              jq -e --arg tag "$GITHUB_REF_NAME" --arg sha "$GITHUB_SHA" '
+                .tag == $tag and .object.type == "commit" and .object.sha == $sha and
+                (.message | type == "string" and
+                  ([split("\n")[] | sub("\r$"; "") | select(startswith("Release-Mode:"))]
+                    | all(. == "Release-Mode: full")))' > /dev/null ||
+                { echo 'The tag must be an ordinary release pointing directly to the candidate commit.' >&2; exit 1; }
+          fi
+          printf 'oid=%s\nsha=%s\n' "$TAG_OID" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  audit:
+    name: Runtime dependency audit
+    if: >-
+      (github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+       github.ref_type == 'tag' && github.event.created && !github.event.deleted && !github.event.forced) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: *verified-npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+
+  browser:
+    name: Plugin browser stand
+    needs: bundle
+    if: >-
+      (github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+       github.ref_type == 'tag' && github.event.created && !github.event.deleted && !github.event.forced) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: *verified-npm
+      - run: npm ci
+      - name: Select the published fork and plugin input
+        id: inputs
+        env:
+          FORK_TAG: ${{ inputs.fork_tag }}
+          PLUGIN_TAG: ${{ inputs.plugin_tag }}
+          BUNDLE_SHA: ${{ needs.bundle.outputs.sha }}
+          ARTIFACT_ID: ${{ needs.bundle.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$BUNDLE_SHA" = "$GITHUB_SHA"
+          locked_tag="$(node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+
+          const read = (path) => JSON.parse(readFileSync(path, 'utf8'));
+          const name = '@super-productivity/plugin-api';
+          const pkg = read('package.json');
+          const lock = read('package-lock.json');
+          const { resolved, integrity, version } = lock.packages['node_modules/' + name];
+          const url = /^https:\/\/github\.com\/daniilmann\/super-productivity\/releases\/download\/v((?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2}-fork\.[1-9]\d{0,2})\/super-productivity-plugin-api-\1\.tgz$/;
+          assert.equal(lock.version, pkg.version);
+          assert.equal(lock.packages[''].version, pkg.version);
+          assert.equal(lock.packages[''].dependencies[name], resolved);
+          assert.equal(pkg.dependencies[name], resolved);
+          assert.match(integrity, /^sha512-[A-Za-z0-9+/]{86}==$/);
+          const fork = url.exec(resolved);
+          assert.ok(fork);
+          assert.equal(version, fork[1]);
+          assert.equal(read('src/manifest.json').minSupVersion, version.split('-fork.')[0]);
+          console.log('v' + version);
+          JS
+          )"
+          if [[ -n "$FORK_TAG" || -n "$PLUGIN_TAG" ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch &&
+               "$FORK_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]{0,2}$ &&
+               "$PLUGIN_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+              { echo 'Supply both published tags for a compatibility run.' >&2; exit 1; }
+          else
+            [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+            FORK_TAG="$locked_tag"
+          fi
+          printf 'fork-tag=%s\nplugin-tag=%s\n' "$FORK_TAG" "$PLUGIN_TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: steps.inputs.outputs.plugin-tag == ''
+        with:
+          artifact-ids: ${{ needs.bundle.outputs.artifact-id }}
+          path: ${{ runner.temp }}/stand-plugin
+      - name: Verify the browser stand assets
+        env:
+          FORK_TAG: ${{ steps.inputs.outputs.fork-tag }}
+          PLUGIN_TAG: ${{ steps.inputs.outputs.plugin-tag }}
+          BUNDLE_DIGEST: ${{ needs.bundle.outputs.zip-sha256 }}
+        run: |
+          set -euo pipefail
+          download_asset() {
+            local repo="$1" tag="$2" name="$3" destination="$4" digest
+            digest="$(curl --disable --fail --silent --show-error --max-time 30 \
+              "$GITHUB_API_URL/repos/$repo/releases/tags/$tag" |
+              jq -er --arg tag "$tag" --arg name "$name" '
+                select(.tag_name == $tag and .draft == false and .prerelease == false)
+                | [.assets[] | select(.name == $name and .state == "uploaded" and .size > 0)]
+                | select(length == 1) | .[0].digest
+                | capture("^sha256:(?<hex>[0-9a-f]{64})$").hex')"
+            curl --disable --fail --silent --show-error --location --proto '=https' --max-time 120 \
+              --output "$destination" "$GITHUB_SERVER_URL/$repo/releases/download/$tag/$name"
+            printf '%s  %s\n' "$digest" "$destination" | sha256sum --check -
+          }
+          plugin_zip="$RUNNER_TEMP/stand-plugin/sp-telos.zip"
+          if [[ -n "$PLUGIN_TAG" ]]; then
+            mkdir -p "$RUNNER_TEMP/stand-plugin"
+            download_asset daniilmann/sp-telos "$PLUGIN_TAG" sp-telos.zip "$plugin_zip"
+            unzip -p "$plugin_zip" manifest.json | jq -e --arg version "${PLUGIN_TAG#v}" '
+              .id == "sp-telos" and .version == $version' > /dev/null
+          else
+            [[ "$BUNDLE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+            printf '%s  %s\n' "$BUNDLE_DIGEST" "$plugin_zip" | sha256sum --check -
+          fi
+          web_zip="$RUNNER_TEMP/fork-web.zip"
+          printf 'Testing fork %s with plugin %s.\n' "$FORK_TAG" "${PLUGIN_TAG:-$GITHUB_SHA}"
+          download_asset daniilmann/super-productivity "$FORK_TAG" superProductivityTelos-web.zip "$web_zip"
+          unzip -q "$web_zip" -d "$RUNNER_TEMP/fork-web"
+          test -s "$RUNNER_TEMP/fork-web/index.html"
+          printf 'SP_TELOS_E2E_WEB_DIR=%s\nSP_TELOS_E2E_PLUGIN_ZIP=%s\n' \
+            "$RUNNER_TEMP/fork-web" "$plugin_zip" >> "$GITHUB_ENV"
+      - run: npm exec -- playwright install --with-deps chromium
+      - name: Run the browser stand and require completed scenarios
+        run: |
+          set -euo pipefail
+          SP_TELOS_E2E_JWT_SECRET="$(openssl rand -hex 32)"
+          [[ "$SP_TELOS_E2E_JWT_SECRET" =~ ^[0-9a-f]{64}$ ]]
+          export SP_TELOS_E2E_JWT_SECRET
+          compose=(docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml)
+          cleanup() {
+            local status=$?
+            "${compose[@]}" down --volumes --remove-orphans || exit 1
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          "${compose[@]}" up -d --wait
+          export PLAYWRIGHT_JSON_OUTPUT_FILE="$RUNNER_TEMP/stand-report.json"
+          rm -f "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+          npm run test:e2e -- --reporter=list,json
+          jq -e '
+            [.suites[] | recurse(.suites[]?) | .specs[]?] as $specs
+            | ($specs | map(.file)) as $files
+            | ($files | index("goals.spec.ts")) != null
+              and ($files | index("save-confirmation.spec.ts")) != null
+              and all($specs[];
+                (.tests | length) > 0 and all(.tests[];
+                  .expectedStatus == "passed" and .status == "expected"
+                  and (.results | length) > 0 and all(.results[]; .status == "passed")))
+          ' "$PLAYWRIGHT_JSON_OUTPUT_FILE" > /dev/null ||
+            { echo 'Both required browser suites must be present and all reported tests must pass.' >&2; exit 1; }
+
+  codeql:
+    name: CodeQL release checks
+    if: >-
+      (github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+       github.ref_type == 'tag' && github.event.created && !github.event.deleted && !github.event.forced) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 17
+    permissions:
+      security-events: read # Read CodeQL analyses and alerts from the default branch.
+    steps:
+      - name: Wait for both analyses, then check open alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          fail() { printf '::error::%s\n' "$1" >&2; exit 1; }
+          test -n "$DEFAULT_BRANCH"
+          ref="refs/heads/$DEFAULT_BRANCH"
+          endpoint="repos/$GITHUB_REPOSITORY/code-scanning"
+
+          api_pages() {
+            local budget="$1" resource="$2"
+            shift 2
+            timeout "${budget}s" gh api --method GET --paginate --slurp "$endpoint/$resource" \
+              -f "ref=$ref" -f tool_name=CodeQL -F per_page=100 "$@" ||
+              fail "CodeQL $resource API request failed or exceeded its time limit."
+          }
+
+          deadline=$((SECONDS + 900))
+          while (( SECONDS < deadline )); do
+            remaining=$((deadline - SECONDS))
+            (( remaining > 0 )) || break
+            budget=$((remaining < 30 ? remaining : 30))
+            analyses="$(api_pages "$budget" analyses)"
+            status="$(jq -er --arg sha "$GITHUB_SHA" --arg ref "$ref" '
+              def language:
+                (try (.environment | fromjson | .language) catch null)
+                // (try (.category | capture("(^|/)language:(?<name>[^/]+)$").name) catch null)
+                // null;
+              def required_language:
+                language | if . == "javascript" or . == "javascript-typescript" then "js-ts" else . end;
+              if type != "array" or length == 0 or any(.[]; type != "array")
+              then error("Invalid analyses pages")
+              else
+                [ .[][] | select(.tool.name == "CodeQL" and .ref == $ref and .commit_sha == $sha)
+                  | . + { language: required_language } ] as $exact
+                | if any($exact[]; (.error | type == "string" and length > 0)) then "failed"
+                  else
+                    [ $exact[] | select(.error == "" and (.rules_count | type == "number" and . > 0)
+                          and (.sarif_id | type == "string" and length > 0)) | .language ]
+                    | if index("js-ts") != null and index("actions") != null then "ready" else "pending" end
+                  end
+              end' <<< "$analyses")"
+            case "$status" in
+              failed) fail "CodeQL reported a failed analysis for $GITHUB_SHA on $ref." ;;
+              ready) break ;;
+              pending)
+                remaining=$((deadline - SECONDS))
+                if (( remaining > 0 )); then
+                  sleep "$((remaining < 15 ? remaining : 15))"
+                fi
+                ;;
+            esac
+          done
+          [[ "${status:-pending}" == ready ]] ||
+            fail "Timed out waiting for successful JS/TS and Actions analyses for $GITHUB_SHA on $ref."
+
+          alerts="$(api_pages 30 alerts -f state=open)"
+          blocked="$(jq -er --arg ref "$ref" '
+            if type != "array" or length == 0 or any(.[]; type != "array") then error("Invalid alert pages")
+            else
+              [ .[][] | if .state == "open" and .tool.name == "CodeQL" and .most_recent_instance.ref == $ref
+                    and (.rule | type == "object")
+                  then . else error("Unexpected alert outside requested CodeQL scope") end
+                | select(.rule.security_severity_level == "high" or .rule.security_severity_level == "critical")
+                | .number ] | length
+            end' <<< "$alerts")"
+          [[ "$blocked" == 0 ]] || fail "$blocked open CodeQL high or critical alert(s) on $ref."
+          printf 'JS/TS and Actions analyses passed for %s on %s. No open high or critical CodeQL alerts.\n' \
+            "$GITHUB_SHA" "$ref"
+
+  full:
+    name: Full gate
+    needs: [gate, browser, audit, codeql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo 'Fast gate, browser stand, dependency audit and CodeQL passed.'
+
+  publish:
+    name: Publish plugin Release
+    needs: [release-tag, full, bundle]
+    if: >-
+      github.repository == 'daniilmann/sp-telos' && github.event_name == 'push' &&
+      github.ref_type == 'tag' && github.event.created && !github.event.deleted && !github.event.forced &&
+      needs.release-tag.outputs.sha == github.sha && needs.bundle.outputs.sha == github.sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: plugin-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # Create and publish the verified draft Release.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.bundle.outputs.artifact-id }}
+          path: ${{ runner.temp }}/release-plugin
+      - name: Verify the ZIP, draft, verify uploaded bytes, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_OID: ${{ needs.release-tag.outputs.oid }}
+          ZIP_SHA256: ${{ needs.bundle.outputs.zip-sha256 }}
+        run: |
+          set -euo pipefail
+          fail() { printf '::error::%s\n' "$1" >&2; exit 1; }
+          tag="$GITHUB_REF_NAME"
+          zip="$RUNNER_TEMP/release-plugin/sp-telos.zip"
+          [[ "$TAG_OID" =~ ^[a-f0-9]{40}$ && "$ZIP_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          test -s "$zip"
+          printf '%s  %s\n' "$ZIP_SHA256" "$zip" | sha256sum --check -
+          unzip -tq "$zip"
+          unzip -p "$zip" manifest.json | jq -e --arg version "${tag#v}" '
+            .id == "sp-telos" and .version == $version' > /dev/null
+          size="$(wc -c < "$zip" | tr -d '[:space:]')"
+
+          verify_remote_tag() {
+            local remote direct peeled
+            remote="$(git ls-remote --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_REF" "$GITHUB_REF^{}")" ||
+              fail 'Cannot read the remote release tag.'
+            direct="$(awk -v ref="$GITHUB_REF" '$2 == ref {print $1}' <<< "$remote")"
+            peeled="$(awk -v ref="$GITHUB_REF^{}" '$2 == ref {print $1}' <<< "$remote")"
+            [[ "$direct" == "$TAG_OID" && "${peeled:-$direct}" == "$GITHUB_SHA" ]] ||
+              fail 'The tag object or target changed.'
+          }
+          releases="repos/$GITHUB_REPOSITORY/releases"
+          get_tag_releases() {
+            gh api --paginate --slurp "$releases?per_page=100" | jq -ce --arg tag "$tag" '
+              if type != "array" or length == 0 or any(.[]; type != "array")
+              then error("Invalid release pages")
+              else [.[][] | select(.tag_name == $tag)] end'
+          }
+
+          # The authenticated list includes drafts. Never overwrite one from a prior attempt.
+          existing="$(get_tag_releases)"
+          [[ "$existing" == '[]' ]] || fail 'A Release for this tag already exists.'
+          verify_remote_tag
+          url="$(gh release create "$tag" "$zip" --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" --notes '' --target "$GITHUB_SHA" --verify-tag --draft)"
+
+          uploaded="$(get_tag_releases)"
+          jq -e --arg url "$url" --arg digest "sha256:$ZIP_SHA256" --argjson size "$size" '
+            length == 1 and (.[0] | .html_url == $url and .draft == true and .prerelease == false
+              and (.body // "") == "" and (.assets | length) == 1
+              and (.assets[0] | .name == "sp-telos.zip" and .state == "uploaded"
+                and .size == $size and .digest == $digest))' <<< "$uploaded" > /dev/null ||
+            fail 'The uploaded Release does not match the verified draft and ZIP.'
+          verify_remote_tag
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false
