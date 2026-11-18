@@ -207,26 +207,31 @@ async function newProfile(browser: Browser, zip: string, contexts: BrowserContex
   return { context, page, frame: await openPlugin(page) };
 }
 
-async function configureSync(page: Page, token: string): Promise<void> {
+async function configureSync(page: Page, token: string): Promise<boolean> {
   await page.locator('button.sync-btn').click({ button: 'right' });
   const signIn = page.locator('dialog-sync-setup');
   const settings = page.locator('dialog-sync-cfg');
   await expect(signIn.or(settings)).toBeVisible();
-  if (await signIn.isVisible()) await signIn.locator('.e2e-other-sync-options').click();
-  await settings.locator('formly-field-mat-select mat-select').click();
-  await page.getByRole('option', { name: 'SuperSync', exact: true }).click();
+  const freshSetup = await signIn.isVisible();
+  if (freshSetup) await signIn.locator('.e2e-other-sync-options').click();
+  const provider = settings.locator('formly-field-mat-select mat-select');
+  const option = page.getByRole('option', { name: /^SuperSync(?: \(Beta\))?$/ });
+  await provider.click();
+  await option.click();
+  await expect(provider).toHaveAttribute('aria-expanded', 'false');
 
+  const input = settings.locator('.e2e-accessToken input, .e2e-accessToken textarea');
+  await expect(input).toBeVisible();
   const baseUrl = settings.locator('.e2e-baseUrl input');
   if (!(await baseUrl.isVisible())) {
     await settings.locator('.collapsible-header').filter({ hasText: 'Advanced' }).click();
   }
   await baseUrl.fill(SYNC_ORIGIN);
-  const input = settings.locator('.e2e-accessToken input, .e2e-accessToken textarea');
   await input.fill(token).catch(() => {
     throw new Error('Could not enter the SuperSync test token');
   });
   await settings.locator('mat-dialog-actions button[mat-flat-button]').click();
-  await expect(settings).toBeHidden();
+  return freshSetup;
 }
 
 async function setEncryption(dialog: Locator, password: string): Promise<void> {
@@ -240,8 +245,12 @@ async function setEncryption(dialog: Locator, password: string): Promise<void> {
   await confirm.click();
 }
 
-async function waitForInitialSync(page: Page, password: string): Promise<void> {
-  const enable = page.locator('dialog-enable-encryption:visible').last();
+async function waitForInitialSync(
+  page: Page,
+  password: string,
+  freshSetup: boolean,
+): Promise<void> {
+  const enable = page.locator('dialog-enable-encryption:visible');
   const unlock = page.locator('dialog-enter-encryption-password:visible');
   const choice = page.locator('sync-first-choice:visible');
   const importConflict = page.locator('dialog-sync-import-conflict:visible');
@@ -250,25 +259,39 @@ async function waitForInitialSync(page: Page, password: string): Promise<void> {
     .filter({ hasText: /initial sync|fresh installation/i });
   const prompts = enable.or(unlock).or(choice).or(importConflict).or(fresh);
   const synced = page.locator(
-    'button.sync-btn[data-sync-confirmation="remote"]:not(:has(mat-icon.spin)):not(:has(mat-icon[data-mat-icon-name="sync_error"]))',
+    'body:not(:has(mat-dialog-container)) button.sync-btn[data-sync-confirmation="remote"]:not(:has(mat-icon.spin)):not(:has(mat-icon[data-mat-icon-name="sync_error"]))',
   );
-  for (let step = 0; step < 6; step++) {
-    await expect(prompts.or(synced).first()).toBeVisible({ timeout: 30_000 });
-    if (await enable.isVisible()) {
-      await setEncryption(enable, password);
-    } else if (await unlock.isVisible()) {
-      await unlock.locator('input[type="password"]').fill(password);
-      await unlock.locator('button[mat-flat-button][color="primary"]').click();
-    } else if (await choice.isVisible()) {
-      await choice.locator('.e2e-first-sync-use-account input').check();
-      await choice.locator('.e2e-first-sync-submit').click();
-    } else if (await importConflict.isVisible()) {
-      await importConflict.getByRole('button', { name: 'Use Server Data', exact: true }).click();
-    } else if (await fresh.isVisible()) {
-      await fresh.locator('button[mat-flat-button]').click();
-    } else if (await synced.isVisible()) {
-      return;
+  // Fresh setup can report remote confirmation before the async encryption prompt opens.
+  let encryptionHandled = !freshSetup;
+  for (let step = 0; step <= 6; step++) {
+    const outcome = encryptionHandled ? prompts.or(synced) : prompts;
+    await expect(outcome.first()).toBeVisible({ timeout: 30_000 });
+    if (encryptionHandled && (await synced.isVisible())) return;
+    if (step === 6) break;
+    const prompt = prompts.last();
+    // Bind the close wait to this instance. Setup and sync can open separate
+    // encryption dialogs, and the next one must remain eligible for handling.
+    const containerId = await prompt.evaluate(
+      (element) => element.closest('mat-dialog-container')?.id,
+    );
+    if (!containerId) throw new Error('SuperSync prompt is missing its dialog container');
+    const container = page.locator('mat-dialog-container').and(page.locator('#' + containerId));
+    if (await container.locator(enable).isVisible()) {
+      await setEncryption(container, password);
+      encryptionHandled = true;
+    } else if (await container.locator(unlock).isVisible()) {
+      await container.locator('input[type="password"]').fill(password);
+      await container.locator('button[mat-flat-button][color="primary"]').click();
+      encryptionHandled = true;
+    } else if (await container.locator(choice).isVisible()) {
+      await container.locator('.e2e-first-sync-use-account input').check();
+      await container.locator('.e2e-first-sync-submit').click();
+    } else if (await container.locator(importConflict).isVisible()) {
+      await container.getByRole('button', { name: 'Use Server Data', exact: true }).click();
+    } else {
+      await container.locator(fresh).locator('button[mat-flat-button]').click();
     }
+    await expect(container).toBeHidden({ timeout: 30_000 });
   }
   throw new Error('SuperSync initial sync did not settle');
 }
@@ -293,8 +316,8 @@ async function connectSync(profile: StandProfile, account: SyncAccount): Promise
   };
   page.on('dialog', handleDialog);
   try {
-    await configureSync(page, account.token);
-    await waitForInitialSync(page, account.encryptionPassword);
+    const freshSetup = await configureSync(page, account.token);
+    await waitForInitialSync(page, account.encryptionPassword, freshSetup);
     await openPlugin(page);
   } finally {
     page.off('dialog', handleDialog);
