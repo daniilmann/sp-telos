@@ -19,8 +19,8 @@ export interface PlanHandoff {
   readonly writes: Plan['writes'];
 }
 
-// The iframe adapter forwards the observer with the same handoff options it already uses.
-export type HandoffObserver = ((message: string) => void) & Pick<Command, 'forceSync'>;
+export type HandoffOptions = Pick<Command, 'forceSync' | 'paceEditing'>;
+export type HandoffObserver = ((message: string) => void) & HandoffOptions;
 
 export function now(): number {
   return Date.now();
@@ -107,13 +107,10 @@ export async function handoffGoalPlan(
   plan: Plan,
   { key, value }: Plan['writes'][number],
   onIncomplete: (message: string) => void,
-  retry: boolean,
+  options: HandoffOptions,
 ) {
   try {
-    const observer = retry
-      ? Object.assign(onIncomplete, { forceSync: true as const })
-      : onIncomplete;
-    await facade.apply(plan, observer);
+    await facade.apply(plan, Object.assign(onIncomplete, options));
     return { applied: true };
   } catch (error) {
     const refreshed = await facade.read([key]).catch(() => undefined);

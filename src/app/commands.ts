@@ -25,11 +25,14 @@ import {
 import type { Draft, DraftStore } from '../platform/draft-store';
 import type { SaveStatus } from './save-status';
 
+export const EDIT_INTERVAL_MS = 2000;
+
 export type Command = {
   readonly cmd: 'apply';
   readonly plan: Plan;
   readonly requestId?: string;
   readonly forceSync?: true;
+  readonly paceEditing?: true;
 };
 export type CompatibilityQuery = { readonly cmd: 'compatibility' };
 export type ApplyingQuery = { readonly cmd: 'isApplying'; readonly requestId: string };
@@ -41,7 +44,9 @@ export function isCommand(message: unknown): message is Command {
   return (
     (!('requestId' in message) || (keys.includes('requestId') && isUuid(message.requestId))) &&
     (!('forceSync' in message) || (keys.includes('forceSync') && message.forceSync === true)) &&
-    keys.every((key) => ['cmd', 'plan', 'requestId', 'forceSync'].includes(key))
+    (!('paceEditing' in message) ||
+      (keys.includes('paceEditing') && message.paceEditing === true)) &&
+    keys.every((key) => ['cmd', 'plan', 'requestId', 'forceSync', 'paceEditing'].includes(key))
   );
 }
 

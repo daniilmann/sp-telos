@@ -8,6 +8,7 @@ import {
 import {
   absent,
   changed,
+  EDIT_INTERVAL_MS,
   updatedInput,
   draftError,
   failedRemoval,
@@ -31,8 +32,6 @@ import {
 } from './commands';
 import { createSaveStatus, saveMessage } from './save-status';
 
-const EDIT_INTERVAL_MS = 2000;
-
 export function createGoalEditor({
   facade,
   drafts,
@@ -52,7 +51,7 @@ export function createGoalEditor({
   let scheduledSave:
     | { readonly timer: ReturnType<typeof setTimeout>; readonly cancel: () => void }
     | undefined;
-  const lastSentByKey = new Map<string, number>();
+  const lastHandoffByKey = new Map<string, number>();
   let dirty = false;
   const status = createSaveStatus({
     read: (keys) => facade.read(keys),
@@ -159,13 +158,13 @@ export function createGoalEditor({
     }
   }
 
-  function editingText(): boolean {
-    return view.intent.action === 'create' || view.intent.action === 'edit';
+  function editingText({ action }: GoalIntent = view.intent): boolean {
+    return action === 'create' || action === 'edit';
   }
 
   function remainingDelay(): number {
-    const lastSent = lastSentByKey.get(view.key);
-    return lastSent === undefined ? 0 : Math.max(0, lastSent + EDIT_INTERVAL_MS - now());
+    const lastHandoff = lastHandoffByKey.get(view.key);
+    return lastHandoff === undefined ? 0 : Math.max(0, lastHandoff + EDIT_INTERVAL_MS - now());
   }
 
   function delaySave(delay: number): Promise<void> {
@@ -264,7 +263,6 @@ export function createGoalEditor({
       const { plan, write } = prepared;
       const sent = { write, generation: epoch };
       submission = sent;
-      lastSentByKey.set(key, now());
       update({ status: 'pending', message: 'Сохраняется…' });
       const result = await handoffGoalPlan(
         facade,
@@ -273,8 +271,9 @@ export function createGoalEditor({
         (deadline) => {
           if (currentForm() && submission === sent && view.status !== 'saved') update({ deadline });
         },
-        retry,
+        retry ? { forceSync: true } : { ...(editingText(intent) && { paceEditing: true }) },
       );
+      if (result.applied) lastHandoffByKey.set(key, now());
       if (formId !== id) return;
       if (result.applied) acceptHandoff(write, baseVer, snapshot, currentForm());
       if (!currentForm()) return;

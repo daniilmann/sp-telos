@@ -19,6 +19,7 @@ const startup = new Promise<string | undefined>((resolve) => {
 
 let tail = startup.then(() => undefined);
 const applying = new Set<string>();
+const editCooldowns = new Map<string, Promise<void>>();
 
 // The host binds the original iframe window and bridge generation before forwarding the body.
 if (typeof PluginAPI.onMessage === 'function') {
@@ -35,7 +36,7 @@ if (typeof PluginAPI.onMessage === 'function') {
       applying.add(requestId);
     }
     const result = tail
-      .then(() => apply(plan, message))
+      .then(() => apply(plan, message, editCooldowns))
       .finally(() => {
         if (requestId !== undefined) applying.delete(requestId);
       });

@@ -107,6 +107,7 @@ function sendRequest(
               ...message,
               requestId: messageId,
               ...(options.onIncomplete?.forceSync && { forceSync: true }),
+              ...(options.onIncomplete?.paceEditing && { paceEditing: true }),
             }
           : message;
       window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message: body }, '*');
