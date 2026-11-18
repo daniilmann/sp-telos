@@ -9,10 +9,11 @@ permissions:
   contents: read
 
 env:
-  FORK_SHA: aab7f62ec24206e378595b2b82d9764d204504d7
-  PLUGIN_SHA: 0e60a9685bd6021968d62f48ff2dbcfcde6d0351
+  FORK_SHA: 04a08b7fc719c79ba90c8a1ce7f8fc9d51317a46
+  PLUGIN_SHA: a0760863f582cfe86007fdfefda217d723069f63
   PLUGIN_BASE_SHA: cab6e3c4e50721ef34326209f755a38170bcfa13
   EXPECTED_SCENARIOS: "12"
+  TARGETED_SCENARIOS: "3"
   TYPES_RUN_ID: '44329171660'
   TYPES_ARTIFACT_ID: '14439250082'
   TYPES_SHA256: 5856e5dd5157f651cf63ddc530deb14e2a51d4adcd702bc011409a631757193f
@@ -129,6 +130,22 @@ jobs:
           docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml config --images | grep -Fx -- "$image"
           docker compose --env-file /dev/null -p sp-telos-e2e -f tests/e2e/compose.yml up -d --wait
           npm run test:e2e -- --list
+          verify_report() {
+            jq -e --argjson expected "$1" \
+              '.stats | {expected,unexpected,flaky,skipped}
+                | select(.expected == $expected and .unexpected == 0 and .flaky == 0 and .skipped == 0)' "$2"
+          }
+          target='offline input survives closing the form and retry obtains a new acknowledgement|concurrent writes leave one intact value and history|Import revokes confirmation for identical data'
+          report="$RUNNER_TEMP/stand-targeted.json"
+          target_status=0
+          PLAYWRIGHT_JSON_OUTPUT_FILE="$report" npm run test:e2e -- --grep "$target" --reporter=list,json || target_status=$?
+          verify_report "$TARGETED_SCENARIOS" "$report" || target_status=1
+
+          report="$RUNNER_TEMP/stand-candidate.json"
+          full_status=0
+          PLAYWRIGHT_JSON_OUTPUT_FILE="$report" npm run test:e2e -- --reporter=list,json || full_status=$?
+          verify_report "$EXPECTED_SCENARIOS" "$report" || full_status=1
+
           report="$RUNNER_TEMP/stand-baseline.json"
           status=0
           SP_TELOS_E2E_PLUGIN_ZIP="$SP_TELOS_E2E_BASE_ZIP" PLAYWRIGHT_JSON_OUTPUT_FILE="$report" \
@@ -138,10 +155,7 @@ jobs:
           jq -e '.stats | .expected == 0 and .unexpected == 1 and .skipped == 0' "$report"
           jq -e '[.. | objects | .message? | strings] | any(contains("Годовые цели"))' "$report"
 
-          report="$RUNNER_TEMP/stand-candidate.json"
-          PLAYWRIGHT_JSON_OUTPUT_FILE="$report" npm run test:e2e -- --reporter=list,json
-          jq -e --argjson expected "$EXPECTED_SCENARIOS" \
-            '.stats | .expected == $expected and .unexpected == 0 and .flaky == 0 and .skipped == 0' "$report"
+          [[ "$target_status" == 0 && "$full_status" == 0 ]]
       - name: Stop the isolated test stack
         if: always()
         working-directory: plugin-src
