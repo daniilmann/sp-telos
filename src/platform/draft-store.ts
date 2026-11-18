@@ -19,7 +19,7 @@ export type FlushResult =
 
 export interface DraftStore {
   read(key: string): Promise<DraftRead>;
-  list(): Promise<readonly string[]>;
+  list(): Promise<{ readonly keys: readonly string[]; readonly failed: boolean }>;
   write(key: string, draft: Draft): void;
   remove(key: string): void;
   flush(): Promise<FlushResult>;
@@ -229,8 +229,9 @@ export function createDraftStore(factory?: Factory): DraftStore {
     return activeFlush;
   }
 
-  function readIntent(intent: Pending): DraftRead {
-    return { value: isDraft(intent.value) ? intent.value : undefined, failed: intent.failed };
+  function readIntent(intent: Pending | undefined, failed = intent?.failed ?? false): DraftRead {
+    const value = intent?.value;
+    return { value: isDraft(value) ? structuredClone(value) : undefined, failed };
   }
 
   return {
@@ -246,12 +247,17 @@ export function createDraftStore(factory?: Factory): DraftStore {
         if (value === undefined || isDraft(value)) return { value, failed: false };
         return { value: undefined, failed: true };
       } catch {
-        const value = pending.get(key)?.value;
-        return { value: isDraft(value) ? value : undefined, failed: true };
+        return readIntent(pending.get(key), true);
       }
     },
     async list() {
-      const keys = await query(await database(), (store) => store.getAllKeys());
+      let keys: IDBValidKey[] = [];
+      let failed = false;
+      try {
+        keys = await query(await database(), (store) => store.getAllKeys());
+      } catch {
+        failed = true;
+      }
       const drafts = new Set(
         keys.filter((key): key is string => typeof key === 'string' && key !== WIPE_VERSION_KEY),
       );
@@ -260,11 +266,11 @@ export function createDraftStore(factory?: Factory): DraftStore {
         if (intent.value === undefined) drafts.delete(key);
         else drafts.add(key);
       }
-      return [...drafts];
+      return { keys: [...drafts], failed };
     },
     write(key, draft) {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
-      enqueue(key, draft);
+      enqueue(key, structuredClone(draft));
     },
     remove(key) {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
