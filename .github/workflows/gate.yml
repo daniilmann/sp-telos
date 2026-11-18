@@ -367,17 +367,45 @@ jobs:
           export PLAYWRIGHT_JSON_OUTPUT_FILE="$RUNNER_TEMP/stand-report.json"
           rm -f "$PLAYWRIGHT_JSON_OUTPUT_FILE"
           npm run test:e2e -- --reporter=list,json
-          jq -e '
-            [.suites[] | recurse(.suites[]?) | .specs[]?] as $specs
-            | ($specs | map(.file)) as $files
-            | ($files | index("goals.spec.ts")) != null
-              and ($files | index("save-confirmation.spec.ts")) != null
-              and all($specs[];
-                (.tests | length) > 0 and all(.tests[];
-                  .expectedStatus == "passed" and .status == "expected"
-                  and (.results | length) > 0 and all(.results[]; .status == "passed")))
+          jq -es '
+            def required_scenarios:
+              {
+                "goals.spec.ts": [
+                  "owner creates edits and closes the three records",
+                  "invalid Objective and KR cannot be saved",
+                  "owner revises the KR and sees one previous version",
+                  "owner revises a closed KR without changing its closure",
+                  "A committed draft survives a journal write failure"
+                ],
+                "save-confirmation.spec.ts": [
+                  "server acknowledgement is visible in the form and data arrives on a second client",
+                  "offline input survives closing the form and retry obtains a new acknowledgement",
+                  "concurrent writes leave one intact value and history",
+                  "The version changes between status and value reads",
+                  "Import revokes confirmation for identical data",
+                  "A newer draft intent arrives during deletion",
+                  "A newer draft intent arrives during deletion (the deletion aborts)"
+                ]
+              }
+              | to_entries | map(.key as $file | .value[] | [$file, [.]]) | sort;
+
+            def scenarios($parents):
+              (.specs[]? | {key: [.file, ($parents + [.title])], ok, tests}),
+              (.suites[]? | scenarios($parents + [.title]));
+
+            def passed_once:
+              .ok == true and (.tests | type == "array" and length == 1)
+              and (.tests[0] |
+                .expectedStatus == "passed" and .status == "expected"
+                and (.results | type == "array" and length == 1)
+                and (.results[0] | .status == "passed" and ((has("retry") | not) or .retry == 0)));
+
+            length == 1 and (
+              [.[0].suites[] | scenarios([])] as $scenarios
+              | ($scenarios | map(.key) | sort) == required_scenarios
+                and all($scenarios[]; passed_once))
           ' "$PLAYWRIGHT_JSON_OUTPUT_FILE" > /dev/null ||
-            { echo 'Both required browser suites must be present and all reported tests must pass.' >&2; exit 1; }
+            { echo 'Each required browser scenario must be reported exactly once and pass on its first attempt.' >&2; exit 1; }
 
   codeql:
     name: CodeQL release checks
