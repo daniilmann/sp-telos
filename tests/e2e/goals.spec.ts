@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { FrameLocator } from '@playwright/test';
 import { buildPlan } from '../../src/core/plan';
-import { planInIframe } from './save-confirmation.fixtures';
+import {
+  draft,
+  draftKeys,
+  form,
+  planInIframe,
+  status,
+  submit as submitPlan,
+} from './save-confirmation.fixtures';
 import { expect, test } from './stand';
 
 const annual = 'Годовые цели';
@@ -288,3 +295,55 @@ for (const isClosed of [false, true]) {
     }
   });
 }
+
+test('A committed draft survives a journal write failure', async ({ stand }) => {
+  const a = await stand.newProfile();
+  const frame = a.frame;
+  const body = form(a);
+  await frame
+    .locator('section')
+    .filter({ has: frame.getByRole('heading', { name: annual, exact: true }) })
+    .getByRole('button', { name: 'Создать' })
+    .click();
+  const input = 'Draft with a failed local journal';
+  await frame.getByLabel(statement, { exact: true }).fill(input);
+  // An unsubmitted create has no synced key yet. Observe the committed IndexedDB
+  // draft before allowing the explicit write to the operation log.
+  await expect.poll(() => draftKeys(body)).toHaveLength(1);
+  const [committedKey] = (await draftKeys(body)) ?? [];
+  if (typeof committedKey !== 'string') throw new Error('Expected a draft record key');
+  expect(await draft(body, committedKey)).toMatchObject({ fields: { statement: input } });
+  await a.page.evaluate((entityId) => {
+    const original = IDBObjectStore.prototype.add;
+    const journal = { aborted: 0 };
+    Object.assign(window, { journal });
+    IDBObjectStore.prototype.add = function (value: unknown, key?: IDBValidKey) {
+      const request = original.call(this, value, key);
+      const row = value as { op?: { d?: string } };
+      if (this.name === 'ops' && this.transaction.db.name === 'SUP_OPS' && row.op?.d === entityId) {
+        this.transaction.addEventListener('abort', () => {
+          journal.aborted += 1;
+        });
+        request.addEventListener('success', () => {
+          this.transaction.abort();
+        });
+      }
+      return request;
+    };
+  }, 'sp-telos:' + committedKey);
+  const write = await submitPlan(a, input);
+  expect(write.key).toBe(committedKey);
+  await expect(
+    frame.getByText('Не сохранено на этом устройстве — перезапустите приложение'),
+  ).toBeVisible();
+  expect((await status(body, [write.key])).keys).toEqual({ [write.key]: { state: 'failed' } });
+  expect(
+    await a.page.evaluate(
+      () => (window as unknown as { journal: { aborted: number } }).journal.aborted,
+    ),
+  ).toBeGreaterThan(0);
+  await button(frame, 'К списку').click();
+  await button(frame, input).or(button(frame, 'Продолжить черновик')).click();
+  await expect(frame.getByLabel(statement, { exact: true })).toBeEditable();
+  await expect(frame.getByLabel(statement, { exact: true })).toHaveValue(input);
+});

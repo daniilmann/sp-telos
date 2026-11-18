@@ -17,9 +17,11 @@ import {
 
 // Keep these origins aligned with compose.yml.
 const WEB_ORIGIN = 'http://127.0.0.1:47173';
-const SYNC_ORIGIN = 'http://127.0.0.1:47901';
+export const SYNC_ORIGIN = 'http://127.0.0.1:47901';
 const SYNC_WS_ORIGIN = 'ws://127.0.0.1:47901';
 const PLUGIN_URL = WEB_ORIGIN + '/#/plugins/sp-telos/index';
+const CONFIG_URL = WEB_ORIGIN + '/#/config';
+const pluginIframe = 'plugin-index iframe[data-plugin-id="sp-telos"]';
 
 const contentTypes = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -136,6 +138,14 @@ async function createSyncAccount(): Promise<SyncAccount> {
   return { userId: user.userId, token: user.token, encryptionPassword: randomUUID() };
 }
 
+export function transport(page: Page) {
+  return page.evaluate(async (url) => {
+    const options = { cache: 'no-store', signal: AbortSignal.timeout(3_000) } as const;
+    const health = await fetch(url, options).catch(() => undefined);
+    return { online: navigator.onLine, health: health?.ok === true };
+  }, SYNC_ORIGIN + '/health');
+}
+
 async function deleteSyncAccount(account: SyncAccount): Promise<void> {
   const response = await syncRequest(`/api/test/user/${String(account.userId)}`, {
     method: 'DELETE',
@@ -161,14 +171,65 @@ export interface Stand {
 }
 
 async function openPlugin(page: Page): Promise<FrameLocator> {
-  await page.goto(PLUGIN_URL);
-  const frame = page.frameLocator('plugin-index iframe[data-plugin-id="sp-telos"]');
+  const iframe = page.locator('.route-wrapper ' + pluginIframe);
+  if (page.url() === PLUGIN_URL) {
+    await page.goto(CONFIG_URL, { timeout: 10_000 });
+    await iframe.waitFor({ state: 'detached', timeout: 10_000 });
+  }
+  await page.goto(PLUGIN_URL, { timeout: 10_000 });
+  const frame = iframe.contentFrame();
   await expect(frame.locator('#app > *').first()).toBeVisible();
   return frame;
 }
 
+export async function openPluginPanel(profile: StandProfile): Promise<StandProfile> {
+  await profile.frame.locator('body').evaluate(() => {
+    PluginAPI.dispatchAction({ type: '[Layout] Show PluginPanel', pluginId: 'sp-telos' });
+  });
+  const frame = profile.page.frameLocator('plugin-panel-container ' + pluginIframe);
+  await expect(frame.getByRole('heading', { name: 'Годовые цели', exact: true })).toBeVisible();
+  await profile.page.goto(CONFIG_URL, { timeout: 10_000 });
+  return { ...profile, frame };
+}
+
+export async function exportAndImport(page: Page): Promise<void> {
+  const timeout = 8_000;
+  const tab = page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("cloud_sync"))');
+  const panel = page.locator('collapsible').filter({ hasText: 'Import/Export' });
+  const imex = panel.locator('file-imex');
+  await base.step('Select the Sync & Backup settings tab', async () => {
+    await tab.click({ timeout });
+    await expect(tab).toHaveAttribute('aria-selected', 'true', { timeout });
+  });
+  await base.step('Expand Import/Export and wait for its controls', async () => {
+    await panel.locator('.collapsible-header, .header').click({ timeout });
+    await expect(panel.locator('.collapsible-panel:not(.ng-animating)')).toBeVisible({ timeout });
+  });
+  const backup = await base.step(
+    'Download the real backup',
+    async () => {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout }),
+        imex.locator('button:has(mat-icon:text-is("file_upload"))').click({ timeout }),
+      ]);
+      return download.path();
+    },
+    { timeout: 12_000 },
+  );
+  await base.step('Import that file and handle the encryption warning if shown', async () => {
+    const warning = page.locator('dialog-import-encryption-warning');
+    const today = /#\/tag\/TODAY\//;
+    await imex.locator('input[type="file"]').setInputFiles(backup, { timeout });
+    await expect
+      .poll(async () => today.test(page.url()) || (await warning.isVisible()), { timeout })
+      .toBe(true);
+    if (await warning.isVisible()) await warning.locator('button[color="warn"]').click({ timeout });
+    await expect(page).toHaveURL(today, { timeout });
+  });
+}
+
 async function installPlugin(page: Page, zip: string): Promise<void> {
-  await page.goto(WEB_ORIGIN + '/#/config');
+  await page.goto(CONFIG_URL);
   await page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("extension"))').click();
   const manager = page.locator('plugin-management');
   await manager.locator('input[type="file"][accept=".zip"]').setInputFiles(zip);

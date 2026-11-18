@@ -2,16 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { applyPlan } from '../../src/core/plan';
 import { decodeRecord } from '../../src/core/records';
 import {
-  annual,
+  blockBackgroundSync,
   button,
-  checkForeignKey,
   committedWrite,
   confirm,
   create,
   deviceId,
   digest,
   draft,
-  draftKeys,
   form,
   load,
   makePlan,
@@ -19,6 +17,7 @@ import {
   pauseDraft,
   planInIframe,
   pull,
+  receipt,
   saved,
   setOffline,
   snapshot,
@@ -26,8 +25,42 @@ import {
   status,
   submit,
   sync,
+  watchUploads,
 } from './save-confirmation.fixtures';
-import { expect, test, type StandProfile } from './stand';
+import { expect, exportAndImport, openPluginPanel, test, type StandProfile } from './stand';
+
+async function checkForeignKey(profile: StandProfile, own: { key: string; value: string }) {
+  const page = profile.page;
+  const origin = new URL(page.url()).origin;
+  const key = 'other:' + randomUUID();
+  const value = '\uFEFF{ "text": "e\u0301" }\n';
+  await page.goto(origin + '/#/config');
+  await page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("extension"))').click();
+  const toggle = page
+    .locator('plugin-management mat-card')
+    .filter({ hasText: 'Doc Mode' })
+    .getByRole('switch');
+  await expect(toggle).toBeVisible();
+  if ((await toggle.getAttribute('aria-checked')) !== 'true') await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-checked', 'true');
+  await page.goto(origin + '/#/plugins/doc-mode/index');
+  const other = page.frameLocator('plugin-index iframe[data-plugin-id="doc-mode"]').locator('body');
+  await other.evaluate((_body, data) => PluginAPI.persistDataSynced(data.value, data.key), {
+    key,
+    value,
+  });
+  await expect(async () => {
+    await sync(other);
+    expect((await status(other, [key])).keys).toEqual({ [key]: receipt(value) });
+  }).toPass({ timeout: 20_000 });
+  await page.goto(origin + '/#/config');
+  await page.goto(origin + '/#/plugins/sp-telos/index');
+  expect(await load(form(profile), key)).toBeNull();
+  expect((await status(form(profile), [own.key, key])).keys).toEqual({
+    [own.key]: receipt(own.value),
+    [key]: { state: 'unknown' },
+  });
+}
 
 test('server acknowledgement is visible in the form and data arrives on a second client', async ({
   stand,
@@ -78,6 +111,7 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await a.page.close();
 
   const page = await a.context.newPage();
+  await blockBackgroundSync(page);
   const reopened = { ...a, page, frame: await stand.openPlugin(page) };
   const persisted = await draft(form(reopened), offline.key);
   const restoredInput = persisted?.fields.statement;
@@ -86,8 +120,12 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await button(reopened.frame, 'Offline value').click();
   await expect(statement(reopened.frame)).toHaveValue(restoredInput);
   const restored = await submit(reopened, restoredInput);
+  await committedWrite(reopened, restored.key, restored.value);
   await expect(retry(reopened)).toBeVisible();
-  const retried = await submit(reopened, '', 'Повторить', reconnect);
+  const uploaded = watchUploads(page);
+  await test.step('Restore navigator online and real SuperSync health', () => reconnect(page));
+  const retried = await test.step('Click Retry with background sync held', () =>
+    submit(reopened, '', 'Повторить'));
   expect(retried.key).toBe(offline.key);
   expect(retried.value).not.toBe(restored.value);
   const before = decodeRecord(restored.key, restored.value);
@@ -95,7 +133,13 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   if (!before.ok || !after.ok) throw new Error('Expected valid retry records');
   expect(after.value.ver).not.toBe(before.value.ver);
   expect(after.value).toMatchObject({ statement: restoredInput });
-  await confirm(reopened, retried);
+  const operation = await committedWrite(reopened, retried.key, retried.value);
+  await test.step(
+    'Match the retry upload and its SuperSync acknowledgement',
+    () => uploaded(operation),
+    { timeout: 20_000 },
+  );
+  await confirm(reopened, retried, false);
   await pull(b, retried.key, retried.value);
 });
 
@@ -140,8 +184,8 @@ test('concurrent writes leave one intact value and history', async ({ stand }) =
   await pull(b, key, seed.writes[2]!.value);
   const open = async (profile: StandProfile) => {
     await stand.openPlugin(profile.page);
-    await button(profile.frame, original.statement).click();
-    await button(profile.frame, 'Пересмотреть результат').click();
+    await button(profile.frame, original.statement).click({ timeout: 8_000 });
+    await button(profile.frame, 'Пересмотреть результат').click({ timeout: 8_000 });
   };
   await Promise.all([open(a), open(b)]);
   const reconnect = await Promise.all([setOffline(a), setOffline(b)]);
@@ -247,9 +291,8 @@ test('The version changes between status and value reads', async ({ stand }) => 
 });
 
 async function watchFirstPollAfterRotation(profile: StandProfile, key: string, originalId: string) {
-  const body = form(profile);
   await profile.page.exposeBinding('readCommittedDeviceId', () => deviceId(profile.page));
-  await body.evaluate(
+  await form(profile).evaluate(
     (_body, input) => {
       const origin = PluginAPI.getSyncedDataSaveState;
       const observed: { result?: unknown } = {};
@@ -258,7 +301,8 @@ async function watchFirstPollAfterRotation(profile: StandProfile, key: string, o
         readCommittedDeviceId(): Promise<string | undefined>;
       };
       PluginAPI.getSyncedDataSaveState = async (keys) => {
-        const id = keys.includes(input.key) ? await readCommittedDeviceId() : undefined;
+        const watching = observed.result === undefined && keys.includes(input.key);
+        const id = watching ? await readCommittedDeviceId() : undefined;
         const result = await origin(keys);
         if (id && id !== input.originalId) observed.result ??= result.keys[input.key];
         return result;
@@ -267,54 +311,55 @@ async function watchFirstPollAfterRotation(profile: StandProfile, key: string, o
     { key, originalId },
   );
   return () =>
-    body.evaluate(
+    form(profile).evaluate(
       () =>
         (window as unknown as { firstRotatedPoll: { result?: unknown } }).firstRotatedPoll.result,
     );
 }
 
 test('Import revokes confirmation for identical data', async ({ stand }) => {
-  const { a, b } = await pair(stand);
-  const initial = await create(a, 'Before import');
-  await confirm(a, initial);
-  await expect.poll(() => draft(form(a), initial.key)).toBeUndefined();
+  const { a: connected, b } = await pair(stand);
+  const initial = await create(connected, 'Before import');
+  await confirm(connected, initial);
+  await expect.poll(() => draft(form(connected), initial.key)).toBeUndefined();
+  const a = await openPluginPanel(connected);
+  await button(a.frame, 'Before import').click({ timeout: 8_000 });
   const paused = await pauseDraft(form(a), initial.key, 'put');
-  const write = await submit(a, 'Identical after import');
-  await paused.entered();
+  const originalValue = 'Identical after import';
   try {
+    const write = await submit(a, originalValue);
+    await paused.entered();
     await confirm(a, write);
     await pull(b, write.key, write.value);
     const oldId = await deviceId(a.page);
     if (!oldId) throw new Error('Expected the committed client ID before import');
     const first = await watchFirstPollAfterRotation(a, write.key, oldId);
-    const tab = await a.context.newPage();
-    const origin = new URL(a.page.url()).origin;
-    // A second tab imports into the same local stores while the original form keeps polling.
-    await tab.goto(origin + '/#/config');
-    await tab.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("cloud_sync"))').click();
-    const panel = tab.locator('collapsible').filter({ hasText: 'Import/Export' });
-    await panel.locator('.collapsible-header').click();
-    const [backup] = await Promise.all([
-      tab.waitForEvent('download'),
-      tab.locator('file-imex button:has(mat-icon:text-is("file_upload"))').click(),
-    ]);
-    const backupPath = await backup.path();
-    if (!backupPath) throw new Error('The app did not export a backup');
-    await tab.locator('file-imex input[type="file"]').setInputFiles(backupPath);
-    await expect(tab).toHaveURL(/#\/tag\/TODAY\//);
-    await expect.poll(() => deviceId(a.page)).not.toBe(oldId);
-    expect(await deviceId(a.page)).toBeTruthy();
-    await expect.poll(first, { timeout: 12_000 }).toEqual({ state: 'unknown' });
-    await expect(a.frame.getByText(saved)).toHaveCount(0);
-    expect(await load(form(a), write.key)).toBe(write.value);
-    const imported = await stand.openPlugin(tab);
-    expect(await load(imported.locator('body'), write.key)).toBe(write.value);
-  } finally {
-    await paused.release();
+    await exportAndImport(a.page);
+    await test.step('Observe the committed client ID rotation', async () => {
+      await expect
+        .poll(async () => {
+          const rotated = await deviceId(a.page);
+          return Boolean(rotated && rotated !== oldId);
+        })
+        .toBe(true);
+    });
+    await test.step('Observe the first post-rotation poll and the unchanged bytes and version', async () => {
+      await expect.poll(first, { timeout: 12_000 }).toEqual({ state: 'unknown' });
+      await expect(a.frame.getByText(saved)).toHaveCount(0);
+      expect(await load(form(a), write.key)).toBe(write.value);
+    });
+    await test.step('Release the queued draft and verify it survives', async () => {
+      await paused.release();
+      await expect.poll(async () => (await paused.read()).outcome).toBe('complete');
+      expect((await paused.read()).deletes).toBe(0);
+      expect((await draft(form(a), write.key))?.fields.statement).toBe(originalValue);
+    });
+    const imported = (await stand.openPlugin(a.page)).locator('body');
+    expect(await load(imported, write.key)).toBe(write.value);
+  } catch (error) {
+    await paused.release().catch(() => undefined);
+    throw error;
   }
-  await expect.poll(async () => (await paused.read()).outcome).toBe('complete');
-  expect((await paused.read()).deletes).toBe(0);
-  expect((await draft(form(a), write.key))?.fields.statement).toBe('Identical after import');
 });
 
 for (const abort of [false, true]) {
@@ -326,79 +371,39 @@ for (const abort of [false, true]) {
     await expect.poll(() => draft(form(a), initial.key)).toBeUndefined();
     const paused = await pauseDraft(form(a), initial.key, 'delete', abort);
     const update = await submit(a, 'Confirmed draft');
+    const reason = 'Latest unsubmitted intention';
+    const input = a.frame.getByLabel('Причина закрытия');
     try {
       await confirm(a, update);
       await paused.entered();
       await button(a.frame, 'Закрыть запись').click();
-      await a.frame.getByLabel('Причина закрытия').fill('Latest unsubmitted intention');
+      await input.fill(reason);
       await expect(a.frame.getByText(saved)).toHaveCount(0);
     } finally {
       await paused.release();
     }
     await expect.poll(async () => (await paused.read()).outcome).toBe(abort ? 'abort' : 'complete');
+    if (abort)
+      await test.step('Observe the queued intent and retry the failed draft write', async () => {
+        await expect(input).toHaveValue(reason);
+        expect(await draft(form(a), update.key)).toMatchObject({
+          fields: { action: 'create', statement: 'Confirmed draft' },
+        });
+        await expect(a.frame.getByText('Черновик на этом устройстве не сохраняется')).toBeVisible();
+        expect((await paused.read()).reason).toBe('');
+        await button(a.frame, 'Повторить операцию с черновиком').click({ timeout: 8_000 });
+      });
+    await expect.poll(async () => (await paused.read()).reason).toBe(reason);
+    await expect(a.frame.getByText(saved)).toHaveCount(0);
     await expect
       .poll(() => draft(form(a), update.key))
       .toMatchObject({
-        fields: { action: 'close', reason: 'Latest unsubmitted intention' },
+        fields: { action: 'close', reason },
       });
     await a.page.close();
     const reopened = await stand.openPlugin(await a.context.newPage());
     await button(reopened, 'Confirmed draft').click();
-    await expect(reopened.getByLabel('Причина закрытия')).toHaveValue(
-      'Latest unsubmitted intention',
-    );
+    await expect(reopened.getByLabel('Причина закрытия')).toHaveValue(reason);
     await pull(b, update.key, update.value);
   });
 }
-
-test('A committed draft survives a journal write failure', async ({ stand }) => {
-  const a = await stand.newProfile();
-  const frame = a.frame;
-  const body = form(a);
-  await frame
-    .locator('section')
-    .filter({ has: frame.getByRole('heading', { name: annual, exact: true }) })
-    .getByRole('button', { name: 'Создать' })
-    .click();
-  const input = 'Draft with a failed local journal';
-  await statement(frame).fill(input);
-  // An unsubmitted create has no synced key yet. Observe the committed IndexedDB
-  // draft before allowing the explicit write to the operation log.
-  await expect.poll(() => draftKeys(body)).toHaveLength(1);
-  const [committedKey] = (await draftKeys(body)) ?? [];
-  if (typeof committedKey !== 'string') throw new Error('Expected a draft record key');
-  expect(await draft(body, committedKey)).toMatchObject({ fields: { statement: input } });
-  await a.page.evaluate((entityId) => {
-    const original = IDBObjectStore.prototype.add;
-    const journal = { aborted: 0 };
-    Object.assign(window, { journal });
-    IDBObjectStore.prototype.add = function (value: unknown, key?: IDBValidKey) {
-      const request = original.call(this, value, key);
-      const row = value as { op?: { d?: string } };
-      if (this.name === 'ops' && this.transaction.db.name === 'SUP_OPS' && row.op?.d === entityId) {
-        this.transaction.addEventListener('abort', () => {
-          journal.aborted += 1;
-        });
-        request.addEventListener('success', () => {
-          this.transaction.abort();
-        });
-      }
-      return request;
-    };
-  }, 'sp-telos:' + committedKey);
-  const write = await submit(a, input);
-  expect(write.key).toBe(committedKey);
-  await expect(
-    frame.getByText('Не сохранено на этом устройстве — перезапустите приложение'),
-  ).toBeVisible();
-  expect((await status(body, [write.key])).keys).toEqual({ [write.key]: { state: 'failed' } });
-  expect(
-    await a.page.evaluate(
-      () => (window as unknown as { journal: { aborted: number } }).journal.aborted,
-    ),
-  ).toBeGreaterThan(0);
-  await button(frame, 'К списку').click();
-  await button(frame, input).or(button(frame, 'Продолжить черновик')).click();
-  await expect(statement(frame)).toBeEditable();
-  await expect(statement(frame)).toHaveValue(input);
-});
