@@ -16,6 +16,7 @@ import {
   pair,
   pauseDraft,
   planInIframe,
+  pressEnter,
   pull,
   receipt,
   saved,
@@ -25,11 +26,13 @@ import {
   status,
   submit,
   sync,
+  watchDownloads,
   watchUploads,
 } from './save-confirmation.fixtures';
 import {
   expect,
   expectSyncHealthy,
+  expectSyncReady,
   exportAndImport,
   openPluginIndex,
   openPluginPanel,
@@ -122,9 +125,13 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   const restored = await submit(reopened, restoredInput);
   await committedWrite(reopened, restored);
   await expect(button(reopened.frame, 'Повторить')).toBeVisible();
-  await test.step('Verify loopback SuperSync process readiness', expectSyncHealthy);
+  await expectSyncHealthy();
   expect(uploads.count(), 'Browser uploads while offline').toBe(0);
-  await test.step('Restore the browser network and navigator online', () => reconnect(page));
+  await reconnect(page);
+  await expectSyncReady(page);
+  expect(uploads.count(), 'Browser uploads before Retry').toBe(0);
+  // The second profile sees the persisted encrypted operation before host decryption.
+  const downloaded = watchDownloads(b.page);
   const retried = await test.step('Click Retry with background sync held', () =>
     submit(reopened, '', 'Повторить'));
   expect(retried.key).toBe(offline.key);
@@ -134,13 +141,11 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   if (!before.ok || !after.ok) throw new Error('Expected valid retry records');
   expect(after.value.ver).not.toBe(before.value.ver);
   expect(after.value).toMatchObject({ statement: restoredInput });
-  await test.step(
-    'Prove browser transport with the exact encrypted retry POST and accepted SuperSync acknowledgement',
-    async () => uploads.accepted(await committedWrite(reopened, retried)),
-    { timeout: 20_000 },
-  );
+  const local = await committedWrite(reopened, retried);
+  const serverSeq = await uploads.accepted(local, 'gzip');
   await confirm(reopened, retried, false);
   await pull(b, retried.key, retried.value);
+  await downloaded({ ...local, isPayloadEncrypted: true }, serverSeq);
 });
 
 test('concurrent writes leave one intact value and history', async ({ stand }) => {
@@ -182,11 +187,7 @@ test('concurrent writes leave one intact value and history', async ({ stand }) =
   const open = async (profile: StandProfile) => {
     await stand.openPlugin(profile.page);
     await button(profile.frame, original.statement).click({ timeout: 8_000 });
-    const revise = button(profile.frame, 'Пересмотреть результат');
-    await expect(revise).toBeVisible();
-    await expect(revise).toBeEnabled();
-    await revise.focus();
-    await revise.press('Enter');
+    await pressEnter(button(profile.frame, 'Пересмотреть результат'));
   };
   await Promise.all([open(a), open(b)]);
   const reconnect = await Promise.all([setOffline(a), setOffline(b)]);
@@ -355,7 +356,8 @@ test('Import revokes confirmation for identical data', async ({ stand }) => {
       expect((await paused.read()).deletes).toBe(0);
       expect((await draft(form(a), write.key))?.fields.statement).toBe(originalValue);
     });
-    const imported = (await stand.openPlugin(a.page)).locator('body');
+    await a.page.close();
+    const imported = (await stand.openPlugin(await a.context.newPage())).locator('body');
     expect(await load(imported, write.key)).toBe(write.value);
   } catch (error) {
     await paused.release().catch(() => undefined);

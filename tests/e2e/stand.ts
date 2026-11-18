@@ -13,6 +13,7 @@ import {
   type FrameLocator,
   type Locator,
   type Page,
+  type Request,
 } from '@playwright/test';
 
 // Keep these origins aligned with compose.yml.
@@ -94,20 +95,6 @@ interface SyncAccount {
   encryptionPassword: string;
 }
 
-function isTestUser(value: unknown): value is Pick<SyncAccount, 'userId' | 'token'> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'userId' in value &&
-    typeof value.userId === 'number' &&
-    Number.isSafeInteger(value.userId) &&
-    value.userId > 0 &&
-    'token' in value &&
-    typeof value.token === 'string' &&
-    value.token.length > 0
-  );
-}
-
 function syncRequest(path: string, options: RequestInit = {}): Promise<Response> {
   return fetch(SYNC_ORIGIN + path, {
     ...options,
@@ -126,16 +113,33 @@ async function createSyncAccount(): Promise<SyncAccount> {
       password: randomUUID(),
     }),
   });
-  if (response.status !== 201) {
-    throw new Error(`SuperSync test account creation returned HTTP ${String(response.status)}`);
-  }
-  const user: unknown = await response.json().catch(() => null);
-  if (!isTestUser(user)) throw new Error('Invalid response from SuperSync test account endpoint');
-  return { userId: user.userId, token: user.token, encryptionPassword: randomUUID() };
+  expect(response.status, 'SuperSync test account creation').toBe(201);
+  const user = (await response.json().catch(() => null)) as {
+    userId?: unknown;
+    token?: unknown;
+  } | null;
+  const { userId, token } = user ?? {};
+  if (typeof userId !== 'number' || !Number.isSafeInteger(userId) || userId <= 0)
+    throw new Error('Invalid user ID from SuperSync test account endpoint');
+  if (typeof token !== 'string' || !token.length)
+    throw new Error('Invalid token from SuperSync test account endpoint');
+  return { userId, token, encryptionPassword: randomUUID() };
 }
 
 export async function expectSyncHealthy(): Promise<void> {
   expect((await syncRequest('/health')).status, 'Loopback SuperSync /health').toBe(200);
+}
+
+export function isSyncOps(request: Request, method: 'GET' | 'POST'): boolean {
+  const { origin, pathname } = new URL(request.url());
+  return request.method() === method && origin === SYNC_ORIGIN && pathname === '/api/sync/ops';
+}
+
+export function expectSyncReady(page: Page) {
+  const ready = page.locator(
+    'body:not(:has(mat-dialog-container)) button.sync-btn:not(.is-in-progress):has(mat-icon:is([data-mat-icon-name="sync_ring"], [data-mat-icon-name="sync_done"]))',
+  );
+  return expect(ready, 'Restarted host has a ready and idle online sync provider').toBeVisible();
 }
 
 async function deleteSyncAccount(account: SyncAccount): Promise<void> {

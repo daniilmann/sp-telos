@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import type { BrowserContext, FrameLocator, Locator, Page, Request } from '@playwright/test';
+import type { BrowserContext, FrameLocator, Locator, Page, Response } from '@playwright/test';
 import { buildPlan, isPlan, type Plan } from '../../src/core/plan';
 import { RECORD_PREFIXES } from '../../src/core/records';
 import type { Draft } from '../../src/platform/draft-store';
-import { expect, SYNC_ORIGIN, test, type Stand, type StandProfile } from './stand';
+import { expect, isSyncOps, test, type Stand, type StandProfile } from './stand';
 
 export const saved = /^Сохранено в (?:[01]\d|2[0-3]):[0-5]\d$/;
 const partitions = new WeakSet<BrowserContext>();
@@ -58,6 +58,14 @@ export function receipt(raw: string) {
   return { state: 'saved', valueSha256: digest(raw), savedAt: expect.any(Number) };
 }
 
+export async function pressEnter(control: Locator, timeout?: number) {
+  const options = timeout === undefined ? undefined : { timeout };
+  await expect(control).toBeVisible(options);
+  await expect(control).toBeEnabled(options);
+  await control.focus(options);
+  await control.press('Enter', options);
+}
+
 async function nextPlan(profile: StandProfile, action: string): Promise<Plan> {
   const timeout = action === 'Повторить' ? 25_000 : 8_000;
   const iframe = profile.frame.owner();
@@ -74,19 +82,17 @@ async function nextPlan(profile: StandProfile, action: string): Promise<Plan> {
         window.removeEventListener('message', read);
         resolve(event.data.message.plan);
       }
-      signal.addEventListener(
-        'abort',
-        () => {
-          resolve(undefined);
-        },
-        { once: true },
-      );
+      signal.onabort = () => {
+        resolve(undefined);
+      };
       window.addEventListener('message', read, { signal });
     });
     return { plan };
   }, timeout + 2_000);
   try {
-    await button(profile.frame, action).click({ timeout });
+    const control = button(profile.frame, action);
+    if (action === 'Подтвердить пересмотр') await pressEnter(control, timeout);
+    else await control.click({ timeout });
     const plan = await message.evaluate((message) => message.plan);
     if (!isPlan(plan)) throw new Error('Expected a plan from the form');
     return plan;
@@ -223,11 +229,7 @@ export async function committedWrite(
       return data === value;
     })?.op;
   };
-  await expect
-    .poll(async () => Boolean(await find()), {
-      message: 'Exact value committed in SUP_OPS',
-    })
-    .toBe(true);
+  await expect.poll(find, { message: 'Exact value committed in SUP_OPS' }).toBeDefined();
   const operation = await find();
   if (!operation) throw new Error('No committed operation');
   return { id: operation.id, clientId: operation.c };
@@ -239,34 +241,30 @@ export async function pauseDraft(
   method: 'put' | 'delete',
   abort = false,
 ) {
-  await body.evaluate(
+  const barrier = await body.evaluateHandle(
     (_body, wait) => {
       const proto = IDBObjectStore.prototype;
       const { put, delete: remove } = proto;
       const state = { entered: false, released: false, deletes: 0, outcome: '', reason: '' };
-      Object.assign(window, { draftBarrier: state });
       const matches = (store: IDBObjectStore, key: unknown) =>
         key === wait.key &&
-        store.transaction.db.name === 'sp-telos-drafts' &&
-        store.name === 'drafts';
+        store.name === 'drafts' &&
+        store.transaction.db.name === 'sp-telos-drafts';
       function hold(store: IDBObjectStore) {
-        if (state.released) {
-          if (wait.abort) store.transaction.abort();
-          return;
-        }
-        store.count(wait.key).addEventListener('success', () => {
-          hold(store);
-        });
+        if (!state.released) {
+          store.count(wait.key).addEventListener('success', () => {
+            hold(store);
+          });
+        } else if (wait.abort) store.transaction.abort();
       }
       function intercept(store: IDBObjectStore, request: IDBRequest) {
         if (state.entered) return;
         state.entered = true;
-        store.transaction.addEventListener('complete', () => {
-          state.outcome = 'complete';
-        });
-        store.transaction.addEventListener('abort', () => {
-          state.outcome = 'abort';
-        });
+        const finish = ({ type }: Event) => {
+          state.outcome = type;
+        };
+        store.transaction.addEventListener('complete', finish);
+        store.transaction.addEventListener('abort', finish);
         request.addEventListener('success', () => {
           hold(store);
         });
@@ -280,9 +278,8 @@ export async function pauseDraft(
         if (wait.method === 'delete' && state.entered) {
           const fields = (value as Draft | undefined)?.fields;
           this.transaction.addEventListener('complete', () => {
-            if (fields?.action === 'close' && typeof fields.reason === 'string') {
+            if (fields?.action === 'close' && typeof fields.reason === 'string')
               state.reason = fields.reason;
-            }
           });
         }
         return request;
@@ -295,28 +292,19 @@ export async function pauseDraft(
         }
         return request;
       };
+      return state;
     },
     { key, method, abort },
   );
-  const read = () =>
-    body.evaluate(
-      () =>
-        (
-          window as unknown as {
-            draftBarrier: { entered: boolean; deletes: number; outcome: string; reason: string };
-          }
-        ).draftBarrier,
-    );
   return {
-    read,
-    entered: () => expect.poll(async () => (await read()).entered).toBe(true),
+    read: () => barrier.jsonValue(),
+    entered: () => expect.poll(async () => (await barrier.jsonValue()).entered).toBe(true),
     release: () =>
       body.evaluate(
-        () => {
-          (window as unknown as { draftBarrier: { released: boolean } }).draftBarrier.released =
-            true;
+        (_body, state) => {
+          state.released = true;
         },
-        undefined,
+        barrier,
         { timeout: 2_000 },
       ),
   };
@@ -327,32 +315,21 @@ export async function planInIframe(body: Locator, plan: Plan) {
     (_body, data) =>
       new Promise<void>((resolve, reject) => {
         const messageId = crypto.randomUUID();
+        const origin = 'http://127.0.0.1:47173';
         const signal = AbortSignal.timeout(10_000);
-        signal.addEventListener(
-          'abort',
-          () => {
-            reject(new Error('No reply to the seed plan'));
-          },
-          {
-            once: true,
-          },
-        );
+        signal.onabort = () => {
+          reject(new Error('No reply to the seed plan'));
+        };
         function receive(event: MessageEvent<{ type?: string; messageId?: string } | null>) {
-          if (event.origin !== 'http://127.0.0.1:47173') return;
+          if (event.origin !== origin) return;
           if (event.source !== window.parent || event.data?.messageId !== messageId) return;
           window.removeEventListener('message', receive);
           if (event.data.type === 'PLUGIN_MESSAGE_RESPONSE') resolve();
           else reject(new Error('Seed plan rejected'));
         }
         window.addEventListener('message', receive, { signal });
-        window.parent.postMessage(
-          {
-            type: 'PLUGIN_MESSAGE',
-            messageId,
-            message: { cmd: 'apply', requestId: messageId, plan: data },
-          },
-          'http://127.0.0.1:47173',
-        );
+        const message = { cmd: 'apply', requestId: messageId, plan: data };
+        window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message }, origin);
       }),
     plan,
   );
@@ -392,34 +369,61 @@ export function blockBackgroundSync(page: Page) {
   });
 }
 
-export function watchUploads(context: BrowserContext) {
-  const sent: Request[] = [];
-  context.on('request', (request) => {
-    if (request.method() === 'POST' && request.url().startsWith(SYNC_ORIGIN + '/api/sync/ops?'))
-      sent.push(request);
+type SyncOperation = { id: string; clientId: string; isPayloadEncrypted: boolean };
+type UploadResult = { opId: string; accepted: boolean; serverSeq: number };
+type SyncReply = { results?: UploadResult[]; ops?: { serverSeq: number; op: SyncOperation }[] };
+
+function observeOps(source: BrowserContext | Page, method: 'GET' | 'POST') {
+  const replies: (SyncReply & { response: Response })[] = [];
+  source.on('response', async (response: Response) => {
+    if (!response.ok() || !isSyncOps(response.request(), method)) return;
+    const body = (await response.json().catch(() => null)) as SyncReply | null;
+    if (body) replies.push({ response, ...body });
   });
-  const accepted = async (local: { id: string; clientId: string }) => {
-    const find = () =>
-      sent.find((request) => {
+  return replies;
+}
+
+export function watchUploads(context: BrowserContext) {
+  let sent = 0;
+  context.on('request', (request) => {
+    if (isSyncOps(request, 'POST')) sent++;
+  });
+  // Read replies as they arrive, before the test looks up the committed operation ID.
+  const replies = observeOps(context, 'POST');
+  return {
+    count: () => sent,
+    async accepted(local: { id: string; clientId: string }, proof: 'body' | 'gzip' = 'body') {
+      const find = () =>
+        replies.find(({ results }) => results?.some(({ opId }) => opId === local.id));
+      const replyStatus = () =>
+        find()?.response.status() ?? (sent ? 'no matching successful reply' : 'no SuperSync POST');
+      await expect
+        .poll(replyStatus, { timeout: 20_000, message: 'POST status for the exact operation ID' })
+        .toBe(200);
+      const { response, results } = find()!;
+      const result = results!.find(({ opId }) => opId === local.id)!;
+      expect(result).toMatchObject({ accepted: true, serverSeq: expect.any(Number) });
+      const request = response.request();
+      if (proof === 'gzip') {
+        expect(await request.headerValue('content-encoding'), 'Retry POST encoding').toBe('gzip');
+      } else {
         const raw = request.postDataBuffer();
-        if (!raw) return false;
-        const json = raw[0] === 0x1f ? gunzipSync(raw).toString('utf8') : raw.toString('utf8');
-        const { ops } = JSON.parse(json) as {
-          ops: { id: string; clientId: string; isPayloadEncrypted: boolean }[];
-        };
-        return ops.some(
-          (op) => op.id === local.id && op.clientId === local.clientId && op.isPayloadEncrypted,
-        );
-      });
-    await expect.poll(find, { timeout: 20_000 }).toBeDefined();
-    const reply = await find()?.response();
-    expect(reply?.status(), 'HTTP status of the exact upload').toBe(200);
-    const { results } = (await reply!.json()) as {
-      results: { opId: string; accepted: boolean; serverSeq?: number }[];
-    };
-    const result = results.find(({ opId }) => opId === local.id);
-    expect(result?.accepted, 'SuperSync accepted the exact operation').toBe(true);
-    expect(result?.serverSeq).toEqual(expect.any(Number));
+        if (!raw) throw new Error('Playwright could not read the encrypted upload body');
+        const json = (raw[0] === 0x1f ? gunzipSync(raw) : raw).toString('utf8');
+        const { ops } = JSON.parse(json) as { ops: SyncOperation[] };
+        expect(ops).toContainEqual(expect.objectContaining({ ...local, isPayloadEncrypted: true }));
+      }
+      return result.serverSeq;
+    },
   };
-  return { accepted, count: () => sent.length };
+}
+
+export function watchDownloads(page: Page) {
+  const replies = observeOps(page, 'GET');
+  return (op: SyncOperation, serverSeq: number) =>
+    expect
+      .poll(() => replies.flatMap((reply) => reply.ops ?? []).find((row) => row.op.id === op.id), {
+        message: 'Second profile received the exact encrypted server operation',
+      })
+      .toMatchObject({ serverSeq, op });
 }
