@@ -19,7 +19,6 @@ import {
 const WEB_ORIGIN = 'http://127.0.0.1:47173';
 export const SYNC_ORIGIN = 'http://127.0.0.1:47901';
 const SYNC_WS_ORIGIN = 'ws://127.0.0.1:47901';
-const PLUGIN_URL = WEB_ORIGIN + '/#/plugins/sp-telos/index';
 const CONFIG_URL = WEB_ORIGIN + '/#/config';
 const pluginIframe = 'plugin-index iframe[data-plugin-id="sp-telos"]';
 
@@ -118,10 +117,7 @@ function syncRequest(path: string, options: RequestInit = {}): Promise<Response>
 }
 
 async function createSyncAccount(): Promise<SyncAccount> {
-  const health = await syncRequest('/health').catch(() => {
-    throw new Error(`SuperSync is unavailable at ${SYNC_ORIGIN}/health`);
-  });
-  if (!health.ok) throw new Error(`SuperSync /health returned HTTP ${String(health.status)}`);
+  await expectSyncHealthy();
   const response = await syncRequest('/api/test/create-user', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -138,12 +134,8 @@ async function createSyncAccount(): Promise<SyncAccount> {
   return { userId: user.userId, token: user.token, encryptionPassword: randomUUID() };
 }
 
-export function transport(page: Page) {
-  return page.evaluate(async (url) => {
-    const options = { cache: 'no-store', signal: AbortSignal.timeout(3_000) } as const;
-    const health = await fetch(url, options).catch(() => undefined);
-    return { online: navigator.onLine, health: health?.ok === true };
-  }, SYNC_ORIGIN + '/health');
+export async function expectSyncHealthy(): Promise<void> {
+  expect((await syncRequest('/health')).status, 'Loopback SuperSync /health').toBe(200);
 }
 
 async function deleteSyncAccount(account: SyncAccount): Promise<void> {
@@ -170,14 +162,24 @@ export interface Stand {
   connectSync(profile: StandProfile): Promise<void>;
 }
 
-async function openPlugin(page: Page): Promise<FrameLocator> {
-  const iframe = page.locator('.route-wrapper ' + pluginIframe);
-  if (page.url() === PLUGIN_URL) {
+export async function openPluginIndex(page: Page, pluginId: string): Promise<FrameLocator> {
+  if (page.url().startsWith(WEB_ORIGIN + '/#/plugins/')) {
     await page.goto(CONFIG_URL, { timeout: 10_000 });
-    await iframe.waitFor({ state: 'detached', timeout: 10_000 });
   }
-  await page.goto(PLUGIN_URL, { timeout: 10_000 });
+  const frames = page.locator('plugin-index iframe');
+  await expect(frames).toHaveCount(0);
+  await page.goto(WEB_ORIGIN + `/#/plugins/${pluginId}/index`, { timeout: 10_000 });
+  const iframe = frames.and(page.locator(`iframe[data-plugin-id="${pluginId}"]`));
+  await expect(iframe).toBeVisible();
   const frame = iframe.contentFrame();
+  await expect
+    .poll(() => frame.locator('body').evaluate(() => typeof PluginAPI !== 'undefined'))
+    .toBe(true);
+  return frame;
+}
+
+async function openPlugin(page: Page): Promise<FrameLocator> {
+  const frame = await openPluginIndex(page, 'sp-telos');
   await expect(frame.locator('#app > *').first()).toBeVisible();
   return frame;
 }

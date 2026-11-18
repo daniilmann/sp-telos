@@ -4,7 +4,7 @@ import type { BrowserContext, FrameLocator, Locator, Page, Request } from '@play
 import { buildPlan, isPlan, type Plan } from '../../src/core/plan';
 import { RECORD_PREFIXES } from '../../src/core/records';
 import type { Draft } from '../../src/platform/draft-store';
-import { expect, SYNC_ORIGIN, test, transport, type Stand, type StandProfile } from './stand';
+import { expect, SYNC_ORIGIN, test, type Stand, type StandProfile } from './stand';
 
 export const saved = /^Сохранено в (?:[01]\d|2[0-3]):[0-5]\d$/;
 const partitions = new WeakSet<BrowserContext>();
@@ -203,8 +203,12 @@ type JournalRow = {
   };
 };
 
-export async function committedWrite(profile: StandProfile, key: string, value: string) {
-  const entityId = 'sp-telos:' + key;
+export async function committedWrite(
+  profile: StandProfile,
+  { key, value }: { key: string; value: string },
+  pluginId = 'sp-telos',
+) {
+  const entityId = `${pluginId}:${key}`;
   const find = async () => {
     const rows = await idb<JournalRow[]>(profile.page.locator('body'), 'SUP_OPS', 'ops', 'all');
     return rows?.find(({ source, op }) => {
@@ -357,6 +361,8 @@ export async function planInIframe(body: Locator, plan: Plan) {
 export const makePlan = (inputs: Parameters<typeof buildPlan>[1]) =>
   buildPlan('manual', inputs, { at: Date.now(), newId: randomUUID });
 
+const browserOnline = (page: Page) => page.evaluate(() => navigator.onLine);
+
 export async function setOffline(profile: StandProfile) {
   const assets = new URL(profile.page.url()).origin + '/**';
   await profile.context.route(assets, async (route) => {
@@ -365,12 +371,12 @@ export async function setOffline(profile: StandProfile) {
   });
   partitions.add(profile.context);
   await profile.context.setOffline(true);
-  expect(await transport(profile.page)).toEqual({ online: false, health: false });
+  await expect.poll(() => browserOnline(profile.page)).toBe(false);
   return async (page = profile.page) => {
-    await profile.context.setOffline(false);
     await profile.context.unroute(assets);
-    await expect.poll(() => transport(page)).toEqual({ online: true, health: true });
+    await profile.context.setOffline(false);
     partitions.delete(profile.context);
+    await expect.poll(() => browserOnline(page)).toBe(true);
   };
 }
 
@@ -386,13 +392,13 @@ export function blockBackgroundSync(page: Page) {
   });
 }
 
-export function watchUploads(page: Page) {
+export function watchUploads(context: BrowserContext) {
   const sent: Request[] = [];
-  page.on('request', (request) => {
+  context.on('request', (request) => {
     if (request.method() === 'POST' && request.url().startsWith(SYNC_ORIGIN + '/api/sync/ops?'))
       sent.push(request);
   });
-  return async (local: { id: string; clientId: string }) => {
+  const accepted = async (local: { id: string; clientId: string }) => {
     const find = () =>
       sent.find((request) => {
         const raw = request.postDataBuffer();
@@ -405,16 +411,15 @@ export function watchUploads(page: Page) {
           (op) => op.id === local.id && op.clientId === local.clientId && op.isPayloadEncrypted,
         );
       });
-    await expect
-      .poll(() => Boolean(find()), { message: 'Exact encrypted retry operation uploaded' })
-      .toBe(true);
+    await expect.poll(find, { timeout: 20_000 }).toBeDefined();
     const reply = await find()?.response();
-    expect(reply?.status(), 'HTTP status of the exact retry upload').toBe(200);
+    expect(reply?.status(), 'HTTP status of the exact upload').toBe(200);
     const { results } = (await reply!.json()) as {
       results: { opId: string; accepted: boolean; serverSeq?: number }[];
     };
     const result = results.find(({ opId }) => opId === local.id);
-    expect(result?.accepted, 'SuperSync accepted the exact retry operation').toBe(true);
+    expect(result?.accepted, 'SuperSync accepted the exact operation').toBe(true);
     expect(result?.serverSeq).toEqual(expect.any(Number));
   };
+  return { accepted, count: () => sent.length };
 }

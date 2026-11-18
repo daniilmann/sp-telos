@@ -27,40 +27,15 @@ import {
   sync,
   watchUploads,
 } from './save-confirmation.fixtures';
-import { expect, exportAndImport, openPluginPanel, test, type StandProfile } from './stand';
-
-async function checkForeignKey(profile: StandProfile, own: { key: string; value: string }) {
-  const page = profile.page;
-  const origin = new URL(page.url()).origin;
-  const key = 'other:' + randomUUID();
-  const value = '\uFEFF{ "text": "e\u0301" }\n';
-  await page.goto(origin + '/#/config');
-  await page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("extension"))').click();
-  const toggle = page
-    .locator('plugin-management mat-card')
-    .filter({ hasText: 'Doc Mode' })
-    .getByRole('switch');
-  await expect(toggle).toBeVisible();
-  if ((await toggle.getAttribute('aria-checked')) !== 'true') await toggle.click();
-  await expect(toggle).toHaveAttribute('aria-checked', 'true');
-  await page.goto(origin + '/#/plugins/doc-mode/index');
-  const other = page.frameLocator('plugin-index iframe[data-plugin-id="doc-mode"]').locator('body');
-  await other.evaluate((_body, data) => PluginAPI.persistDataSynced(data.value, data.key), {
-    key,
-    value,
-  });
-  await expect(async () => {
-    await sync(other);
-    expect((await status(other, [key])).keys).toEqual({ [key]: receipt(value) });
-  }).toPass({ timeout: 20_000 });
-  await page.goto(origin + '/#/config');
-  await page.goto(origin + '/#/plugins/sp-telos/index');
-  expect(await load(form(profile), key)).toBeNull();
-  expect((await status(form(profile), [own.key, key])).keys).toEqual({
-    [own.key]: receipt(own.value),
-    [key]: { state: 'unknown' },
-  });
-}
+import {
+  expect,
+  expectSyncHealthy,
+  exportAndImport,
+  openPluginIndex,
+  openPluginPanel,
+  test,
+  type StandProfile,
+} from './stand';
 
 test('server acknowledgement is visible in the form and data arrives on a second client', async ({
   stand,
@@ -69,10 +44,10 @@ test('server acknowledgement is visible in the form and data arrives on a second
   const initial = await snapshot(form(a));
   expect(initial).toEqual({ entries: {} });
   const first = await create(a, 'Клиенты — ' + 'e\u0301'.repeat(900));
-  await committedWrite(a, first.key, first.value);
+  await committedWrite(a, first);
   await confirm(a, first);
   const next = await submit(a, 'Клиенты — ' + 'é'.repeat(900));
-  await committedWrite(a, next.key, next.value);
+  await committedWrite(a, next);
   await confirm(a, next);
   const expected = applyPlan(applyPlan(initial, first.plan), next.plan);
   expect(expected.entries).toEqual({ [next.key]: next.value });
@@ -81,7 +56,34 @@ test('server acknowledgement is visible in the form and data arrives on a second
   expect(await snapshot(form(b))).toEqual(expected);
   await stand.openPlugin(b.page);
   await expect(button(b.frame, 'Клиенты — ' + 'é'.repeat(900))).toBeVisible();
-  await checkForeignKey(a, next);
+
+  const { page } = a;
+  const key = 'other:' + randomUUID();
+  const value = '\uFEFF{ "text": "e\u0301" }\n';
+  await page.goto(new URL('/#/config', page.url()).href);
+  await page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("extension"))').click();
+  const card = page.locator('plugin-management mat-card', { hasText: 'Doc Mode' });
+  const toggle = card.getByRole('switch');
+  if ((await toggle.getAttribute('aria-checked')) !== 'true') await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-checked', 'true');
+  const other = (await openPluginIndex(page, 'doc-mode')).locator('body');
+  const uploads = watchUploads(a.context);
+  await other.evaluate((_body, data) => PluginAPI.persistDataSynced(data.value, data.key), {
+    key,
+    value,
+  });
+  const operation = await committedWrite(a, { key, value }, 'doc-mode');
+  await expect(async () => {
+    await sync(other);
+    expect((await status(other, [key])).keys).toEqual({ [key]: receipt(value) });
+  }).toPass({ timeout: 20_000 });
+  await uploads.accepted(operation);
+  await stand.openPlugin(page);
+  expect(await load(form(a), key)).toBeNull();
+  expect((await status(form(a), [next.key, key])).keys).toEqual({
+    [next.key]: receipt(next.value),
+    [key]: { state: 'unknown' },
+  });
 });
 
 test('offline input survives closing the form and retry obtains a new acknowledgement', async ({
@@ -92,10 +94,10 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await confirm(a, first);
   await pull(b, first.key, first.value);
   const reconnect = await setOffline(a);
+  const uploads = watchUploads(a.context);
   const offline = await submit(a, 'Offline value');
-  await committedWrite(a, offline.key, offline.value);
-  const retry = (profile: StandProfile) => button(profile.frame, 'Повторить');
-  await expect(retry(a)).toBeVisible();
+  await committedWrite(a, offline);
+  await expect(button(a.frame, 'Повторить')).toBeVisible();
   expect((await status(form(a), [offline.key])).sync).toBe('offline');
   expect(await load(form(b), first.key)).toBe(first.value);
 
@@ -104,9 +106,7 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await statement(a.frame).fill(previousInput);
   await expect
     .poll(() => draft(form(a), offline.key))
-    .toMatchObject({
-      fields: { statement: previousInput },
-    });
+    .toHaveProperty('fields.statement', previousInput);
   await statement(a.frame).fill(newestInput);
   await a.page.close();
 
@@ -120,10 +120,11 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   await button(reopened.frame, 'Offline value').click();
   await expect(statement(reopened.frame)).toHaveValue(restoredInput);
   const restored = await submit(reopened, restoredInput);
-  await committedWrite(reopened, restored.key, restored.value);
-  await expect(retry(reopened)).toBeVisible();
-  const uploaded = watchUploads(page);
-  await test.step('Restore navigator online and real SuperSync health', () => reconnect(page));
+  await committedWrite(reopened, restored);
+  await expect(button(reopened.frame, 'Повторить')).toBeVisible();
+  await test.step('Verify loopback SuperSync process readiness', expectSyncHealthy);
+  expect(uploads.count(), 'Browser uploads while offline').toBe(0);
+  await test.step('Restore the browser network and navigator online', () => reconnect(page));
   const retried = await test.step('Click Retry with background sync held', () =>
     submit(reopened, '', 'Повторить'));
   expect(retried.key).toBe(offline.key);
@@ -133,10 +134,9 @@ test('offline input survives closing the form and retry obtains a new acknowledg
   if (!before.ok || !after.ok) throw new Error('Expected valid retry records');
   expect(after.value.ver).not.toBe(before.value.ver);
   expect(after.value).toMatchObject({ statement: restoredInput });
-  const operation = await committedWrite(reopened, retried.key, retried.value);
   await test.step(
-    'Match the retry upload and its SuperSync acknowledgement',
-    () => uploaded(operation),
+    'Prove browser transport with the exact encrypted retry POST and accepted SuperSync acknowledgement',
+    async () => uploads.accepted(await committedWrite(reopened, retried)),
     { timeout: 20_000 },
   );
   await confirm(reopened, retried, false);
@@ -157,12 +157,9 @@ test('concurrent writes leave one intact value and history', async ({ stand }) =
     target: '60%',
     objectiveKey: objective,
   } as const;
+  const growth = { kind: 'annual-goal', status: 'active', statement: 'Growth' } as const;
   const seed = makePlan([
-    {
-      key: year,
-      base: 'absent',
-      record: { kind: 'annual-goal', status: 'active', statement: 'Growth' },
-    },
+    { key: year, base: 'absent', record: growth },
     {
       key: objective,
       base: 'absent',
@@ -185,7 +182,11 @@ test('concurrent writes leave one intact value and history', async ({ stand }) =
   const open = async (profile: StandProfile) => {
     await stand.openPlugin(profile.page);
     await button(profile.frame, original.statement).click({ timeout: 8_000 });
-    await button(profile.frame, 'Пересмотреть результат').click({ timeout: 8_000 });
+    const revise = button(profile.frame, 'Пересмотреть результат');
+    await expect(revise).toBeVisible();
+    await expect(revise).toBeEnabled();
+    await revise.focus();
+    await revise.press('Enter');
   };
   await Promise.all([open(a), open(b)]);
   const reconnect = await Promise.all([setOffline(a), setOffline(b)]);
@@ -198,7 +199,7 @@ test('concurrent writes leave one intact value and history', async ({ stand }) =
       value: { ...original, target, history: [{ ...original, revisionReason }] },
     });
     expect(write.base).toBe((JSON.parse(seed.writes[2]!.value) as { ver: string }).ver);
-    await committedWrite(profile, write.key, write.value);
+    await committedWrite(profile, write);
     return write.value;
   };
   const values = await Promise.all([
