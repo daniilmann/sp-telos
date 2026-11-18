@@ -89,9 +89,13 @@ export function createGoalEditor({
   }
 
   async function removeConfirmed(proof: NonNullable<typeof confirmation>): Promise<void> {
-    const sameIntent = () => submission === proof.sent && generation === proof.sent.generation;
+    const id = formId;
     const applicable = () =>
-      confirmation === proof && sameIntent() && sameDraft(currentDraft(), proof.draft);
+      formId === id &&
+      confirmation === proof &&
+      submission === proof.sent &&
+      generation === proof.sent.generation &&
+      sameDraft(currentDraft(), proof.draft);
     if (!applicable() || removing === proof) return;
     removing = proof;
     try {
@@ -100,9 +104,8 @@ export function createGoalEditor({
         proof.sent.write.key,
         proof.draft,
         applicable,
-        sameIntent,
       );
-      if (!sameIntent() || !result) return;
+      if (!applicable() || !result) return;
       if (result === 'removed') dirty = false;
       update({ draftMessage: removalMessages[result] });
     } finally {

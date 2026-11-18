@@ -148,22 +148,19 @@ export async function removeConfirmedDraft(
   key: string,
   expected: Draft,
   applicable: () => boolean,
-  sameIntent: () => boolean,
 ): Promise<'removed' | 'write-failed' | 'remove-failed' | undefined> {
   const observed = await drafts.read(key);
-  if (!applicable() || !sameDraft(observed.value, expected)) return undefined;
+  if (!applicable() || (!observed.confirmedRemoval && !sameDraft(observed.value, expected)))
+    return undefined;
   // Drain the pending write before removing. A later poll can revoke this proof while waiting.
   const settled = await drafts.flush();
   if (!applicable()) return undefined;
-  if (!settled.ok) return 'write-failed';
+  if (!settled.ok) return observed.confirmedRemoval ? 'remove-failed' : 'write-failed';
   const latest = await drafts.read(key);
-  const draft = latest.value;
-  if (!applicable() || latest.failed || !draft || !sameDraft(draft, expected)) return undefined;
-  drafts.remove(key);
+  if (!applicable() || latest.failed) return undefined;
+  if (observed.confirmedRemoval) return latest.value === undefined ? 'removed' : undefined;
+  if (!sameDraft(latest.value, expected) || !drafts.removeConfirmed(key, applicable))
+    return undefined;
   const after = await drafts.flush();
-  if (after.ok) return 'removed';
-  const live = await drafts.read(key);
-  // Replace our failed deletion with its draft so a later flush cannot retry obsolete cleanup.
-  if (sameIntent() && live.failed && live.value === undefined) drafts.write(key, draft);
-  return 'remove-failed';
+  return after.ok ? 'removed' : 'remove-failed';
 }

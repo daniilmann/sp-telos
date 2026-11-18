@@ -11,7 +11,11 @@ export interface Draft {
   readonly at: number;
 }
 
-export type DraftRead = { readonly value: Draft | undefined; readonly failed: boolean };
+export type DraftRead = {
+  readonly value: Draft | undefined;
+  readonly failed: boolean;
+  readonly confirmedRemoval?: true;
+};
 
 export type FlushResult =
   | { readonly ok: true }
@@ -22,6 +26,7 @@ export interface DraftStore {
   list(): Promise<{ readonly keys: readonly string[]; readonly failed: boolean }>;
   write(key: string, draft: Draft): void;
   remove(key: string): void;
+  removeConfirmed(key: string, stillConfirmed: () => boolean): boolean;
   flush(): Promise<FlushResult>;
   readWipeVersion(): Promise<string | undefined>;
   writeWipeVersion(version: string): void;
@@ -32,6 +37,7 @@ type Value = Draft | string | undefined;
 
 interface Pending {
   readonly value: Value;
+  readonly stillConfirmed: (() => boolean) | undefined;
   failed: boolean;
   running: boolean;
 }
@@ -163,10 +169,18 @@ export function createDraftStore(factory?: Factory): DraftStore {
   async function persist(key: string, attempted: Pending): Promise<void> {
     attempted.running = true;
     try {
-      await mutate(await database(), key, attempted.value);
+      const connected = await database();
+      // Opening the database can outlast both the confirmation and a flush deadline.
+      if (
+        !attempted.stillConfirmed ||
+        (pending.get(key) === attempted && attempted.stillConfirmed())
+      )
+        await mutate(connected, key, attempted.value);
     } catch {
       const latest = pending.get(key);
-      if (latest) {
+      if (latest === attempted && attempted.stillConfirmed?.() === false) {
+        pending.delete(key);
+      } else if (latest) {
         latest.running = false;
         latest.failed = true;
       }
@@ -175,7 +189,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
     }
 
     const latest = pending.get(key);
-    // A later intent may have the same value, but only this exact attempt was committed.
+    // Retire only this attempt, whether it committed or was skipped.
     if (latest === attempted) pending.delete(key);
     else if (latest) {
       latest.failed = false;
@@ -184,10 +198,11 @@ export function createDraftStore(factory?: Factory): DraftStore {
     checkFlush?.();
   }
 
-  function enqueue(key: string, value: Value): void {
+  function enqueue(key: string, value: Value, stillConfirmed?: () => boolean): void {
     const previous = pending.get(key);
     const intent = {
       value,
+      stillConfirmed,
       failed: previous?.failed ?? false,
       running: previous?.running ?? false,
     };
@@ -229,25 +244,34 @@ export function createDraftStore(factory?: Factory): DraftStore {
     return activeFlush;
   }
 
+  function visibleIntent(key: string): Pending | undefined {
+    const intent = pending.get(key);
+    return intent?.stillConfirmed?.() === false ? undefined : intent;
+  }
+
   function readIntent(intent: Pending | undefined, failed = intent?.failed ?? false): DraftRead {
     const value = intent?.value;
-    return { value: isDraft(value) ? structuredClone(value) : undefined, failed };
+    return {
+      value: isDraft(value) ? structuredClone(value) : undefined,
+      failed,
+      ...(intent?.stillConfirmed && { confirmedRemoval: true }),
+    };
   }
 
   return {
     flush,
     async read(key) {
-      const intent = pending.get(key);
+      const intent = visibleIntent(key);
       if (intent) return readIntent(intent);
 
       try {
         const value = await query<unknown>(await database(), (store) => store.get(key));
-        const latest = pending.get(key);
+        const latest = visibleIntent(key);
         if (latest) return readIntent(latest);
         if (value === undefined || isDraft(value)) return { value, failed: false };
         return { value: undefined, failed: true };
       } catch {
-        return readIntent(pending.get(key), true);
+        return readIntent(visibleIntent(key), true);
       }
     },
     async list() {
@@ -262,7 +286,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
         keys.filter((key): key is string => typeof key === 'string' && key !== WIPE_VERSION_KEY),
       );
       for (const [key, intent] of pending) {
-        if (key === WIPE_VERSION_KEY) continue;
+        if (key === WIPE_VERSION_KEY || intent.stillConfirmed?.() === false) continue;
         if (intent.value === undefined) drafts.delete(key);
         else drafts.add(key);
       }
@@ -275,6 +299,12 @@ export function createDraftStore(factory?: Factory): DraftStore {
     remove(key) {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
       enqueue(key, undefined);
+    },
+    removeConfirmed(key, stillConfirmed) {
+      if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
+      if (pending.has(key)) return false;
+      enqueue(key, undefined, stillConfirmed);
+      return true;
     },
     async readWipeVersion() {
       const intent = pending.get(WIPE_VERSION_KEY);
