@@ -1,4 +1,4 @@
-// Entry of plugin.js: an es2020 IIFE script, the only place that writes host data.
+// Entry of plugin.js: an es2020 IIFE script.
 import { isCommand } from './app/commands';
 import { createHostFacade } from './platform/facade';
 

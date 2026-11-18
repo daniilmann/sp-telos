@@ -1,4 +1,10 @@
-import { applyPlan, EMPTY_STATE, type Plan, type PlanState } from '../../src/core/plan';
+import {
+  applyPlan,
+  classifyPlan,
+  EMPTY_STATE,
+  type Plan,
+  type PlanState,
+} from '../../src/core/plan';
 import type { Facade } from '../../src/platform/facade';
 
 export interface AppliedPlan {
@@ -25,8 +31,14 @@ export function createFakeFacade(initial: PlanState = EMPTY_STATE, startAt = 0):
     },
     read: () => Promise.resolve(state),
     apply(plan) {
-      state = applyPlan(state, plan);
-      applied.push({ plan, at: clock });
+      const classified = classifyPlan(state, plan);
+      if (!classified.ok) {
+        return Promise.reject(new Error(classified.reason));
+      }
+      if (classified.writes.length > 0) {
+        state = applyPlan(state, plan);
+        applied.push({ plan, at: clock });
+      }
       return Promise.resolve(state);
     },
   };
