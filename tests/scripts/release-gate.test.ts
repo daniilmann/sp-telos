@@ -1,5 +1,8 @@
 /// <reference types="node" />
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { parse } from 'yaml';
 
@@ -150,6 +153,124 @@ it('ordinary plugin tag requires stand audit and zip before publication', () => 
       );
     }
   }
+});
+
+// Mandatory scenarios from the two suites selected by the release Playwright config.
+const browserScenarios = {
+  'goals.spec.ts': [
+    'owner creates edits and closes the three records',
+    'invalid Objective and KR cannot be saved',
+    'owner revises the KR and sees one previous version',
+    'owner revises a closed KR without changing its closure',
+    'A committed draft survives a journal write failure',
+  ],
+  'save-confirmation.spec.ts': [
+    'server acknowledgement is visible in the form and data arrives on a second client',
+    'offline input survives closing the form and retry obtains a new acknowledgement',
+    'concurrent writes leave one intact value and history',
+    'The version changes between status and value reads',
+    'Import revokes confirmation for identical data',
+    'A newer draft intent arrives during deletion',
+    'A newer draft intent arrives during deletion (the deletion aborts)',
+  ],
+};
+
+function completedBrowserReport() {
+  return {
+    suites: Object.entries(browserScenarios).map(([file, titles]) => ({
+      title: file,
+      file,
+      specs: titles.map((title, index) => ({
+        title,
+        file,
+        id: `${file}-${String(index)}`,
+        ok: true,
+        tests: [{ expectedStatus: 'passed', status: 'expected', results: [{ status: 'passed' }] }],
+      })),
+    })),
+  };
+}
+
+function validateBrowserReport(report: ReturnType<typeof completedBrowserReport>) {
+  const browser = gate.jobs.browser!;
+  checkRequiredStep(browser, stand);
+  const run = browser.steps?.find((step) => stand.test(step.run ?? ''))?.run ?? '';
+  const lines = run.split('\n');
+  const playwright = lines.findIndex((line) => stand.test(line));
+  const validator = lines
+    .slice(playwright + 1)
+    .join('\n')
+    .trim();
+  expect(playwright).toBeGreaterThanOrEqual(0);
+  expect(validator, 'The browser job must validate the reported results').not.toBe('');
+
+  // Playwright can exit successfully with an incomplete selection. Exercise the shell
+  // that consumes its JSON after that exit, without starting the browser stand.
+  const directory = mkdtempSync(join(tmpdir(), 'sp-telos-release-report-'));
+  try {
+    const reportFile = join(directory, 'stand-report.json');
+    writeFileSync(reportFile, JSON.stringify(report));
+    const result = spawnSync('/bin/bash', ['-euo', 'pipefail', '-c', validator], {
+      env: { PATH: process.env.PATH, PLAYWRIGHT_JSON_OUTPUT_FILE: reportFile },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    return result;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+it('accepts the report with all twelve required browser scenarios passed', () => {
+  const result = validateBrowserReport(completedBrowserReport());
+  expect(result.status, result.stderr).toBe(0);
+});
+
+it.each(Object.values(browserScenarios).flat())('rejects a report missing %s', (title) => {
+  const report = completedBrowserReport();
+  for (const suite of report.suites)
+    suite.specs = suite.specs.filter((spec) => spec.title !== title);
+  const result = validateBrowserReport(report);
+  expect(result.status, result.stderr).toBeGreaterThan(0);
+});
+
+it('rejects a twelve-entry report with a repeated scenario and a missing scenario', () => {
+  const report = completedBrowserReport();
+  const specs = report.suites[1]!.specs;
+  specs[0] = structuredClone(specs[1]!);
+  const result = validateBrowserReport(report);
+  expect(result.status, result.stderr).toBeGreaterThan(0);
+});
+
+it.each([
+  {
+    name: 'skipped',
+    expectedStatus: 'skipped',
+    status: 'skipped',
+    results: [{ status: 'skipped' }],
+  },
+  {
+    name: 'cancelled',
+    expectedStatus: 'passed',
+    status: 'skipped',
+    results: [{ status: 'interrupted' }],
+  },
+  {
+    name: 'failed',
+    expectedStatus: 'passed',
+    status: 'unexpected',
+    results: [{ status: 'failed' }],
+  },
+  { name: 'never started', expectedStatus: 'passed', status: 'skipped', results: [] },
+])('rejects a report with a $name required scenario', ({ expectedStatus, status, results }) => {
+  const report = completedBrowserReport();
+  const spec = report.suites[1]!.specs[0]!;
+  spec.ok = status === 'skipped';
+  spec.tests = [{ expectedStatus, status, results }];
+  const result = validateBrowserReport(report);
+  expect(result.status, result.stderr).toBeGreaterThan(0);
 });
 
 it('branch and manual runs cannot publish', () => {

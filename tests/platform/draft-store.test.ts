@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDraftStore } from '../../src/platform/draft-store';
+import { removeConfirmedDraft } from '../../src/platform/facade';
 import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
+import { createDeferred } from '../fakes/fake-facade';
 
 const databaseName = 'sp-telos-drafts';
 const goalKey = 'annual-goal:00000000-0000-4000-8000-000000000001';
@@ -62,6 +64,55 @@ async function commitNext(database: Database): Promise<void> {
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
+
+it('keeps another connection’s draft committed after the final confirmation read', async () => {
+  const database = createFakeDraftDatabase();
+  const a = createDraftStore(database.factory);
+  const b = createDraftStore(database.factory);
+  a.write(goalKey, second);
+  await settleEvents();
+  await commitNext(database);
+  expect(await b.read(goalKey)).toEqual({ value: second, failed: false });
+
+  const read = a.read.bind(a);
+  const readCompleted = createDeferred();
+  const allowCleanup = createDeferred();
+  vi.spyOn(a, 'read')
+    .mockImplementationOnce(read)
+    .mockImplementationOnce(async (key) => {
+      const observed = await read(key);
+      expect(observed).toEqual({ value: second, failed: false });
+      readCompleted.resolve();
+      await allowCleanup.promise;
+      return observed;
+    });
+
+  const cleaning = removeConfirmedDraft(a, goalKey, second, () => true);
+  const reachedBoundary = await Promise.race([
+    readCompleted.promise.then(() => true),
+    cleaning.then(() => false),
+  ]);
+  expect(reachedBoundary).toBe(true);
+  // A holds the completed read-only snapshot while B commits the next edit.
+  const nextDraft = { ...latest, baseVer: second.baseVer };
+  b.write(goalKey, nextDraft);
+  const committed = b.flush();
+  await settleEvents();
+  await commitNext(database);
+  expect(await committed).toEqual({ ok: true });
+  expect(database.committedRows(databaseName).get(goalKey)).toEqual(nextDraft);
+
+  allowCleanup.resolve();
+  await settleEvents();
+  const deletion = database.mutations.find((transaction) => !transaction.finished);
+  if (deletion) {
+    deletion.succeedRequest();
+    deletion.complete();
+  }
+  await cleaning;
+  database.restart();
+  expect(await connect(database).read(goalKey)).toEqual({ value: nextDraft, failed: false });
+});
 
 it('commits only on completion and keeps the latest intent per key', async () => {
   const database = createFakeDraftDatabase();

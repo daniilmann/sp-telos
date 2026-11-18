@@ -134,7 +134,7 @@ describe('The version changes between status and value reads', () => {
 });
 
 describe('A saved reply has no valid fingerprint', () => {
-  it.each([undefined, 'BAD', 'A'.repeat(64)])('treats %s as unconfirmed', async (valueSha256) => {
+  it.each([undefined, 'BAD', 'A'.repeat(64)])('treats %s as unknown', async (valueSha256) => {
     const { polls, onStatus, last } = await fixture();
     // A malformed message can arrive at the typed host boundary.
     const reply = {
@@ -144,9 +144,9 @@ describe('A saved reply has no valid fingerprint', () => {
     };
     polls.mockResolvedValue(keyState(reply as SaveState['keys'][string]));
     await advance(1000);
-    expect(last()).toEqual({ state: 'pending' });
+    expect.soft(last()).toEqual({ state: 'unknown' });
     await advance(19_000);
-    expect(last()).toEqual({ state: 'retry' });
+    expect(last()).toEqual({ state: 'unknown' });
     expect(onStatus).not.toHaveBeenCalledWith(expect.objectContaining({ state: 'saved' }));
   });
 });
@@ -276,8 +276,8 @@ describe('Unconfirmed plans retain the editor draft', () => {
     ['The version changes between status and value reads', 'A receipt, B value', 'Сохраняется…'],
     ['The version changes between status and value reads', 'A value, B receipt', 'Заменено другой версией'],
     ['The version changes between status and value reads', 'ABA B → A → B', 'Сохраняется…'],
-    ['A saved reply has no valid fingerprint', 'absent-sha', 'Сохраняется…'],
-    ['A saved reply has no valid fingerprint', 'malformed-sha', 'Сохраняется…'],
+    ['A saved reply has no valid fingerprint', 'absent-sha', 'Состояние неизвестно'],
+    ['A saved reply has no valid fingerprint', 'malformed-sha', 'Состояние неизвестно'],
     ['Import rotates the client ID during hashing or before host response', 'revoked', 'Сохраняется…'],
   ] as const;
 

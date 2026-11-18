@@ -69,7 +69,8 @@ class FakeTransaction extends EventTarget {
       this.#reads--;
       request.succeed(structuredClone(read()));
       queueMicrotask(() => {
-        if (!this.finished && this.mode === 'readonly' && this.#reads === 0) this.complete();
+        if (!this.finished && this.#reads === 0 && !this.#pending.length && !this.#staged.length)
+          this.complete();
       });
     });
     return request;

@@ -1,7 +1,15 @@
+import {
+  isValidElement,
+  toChildArray,
+  type ComponentChildren,
+  type FunctionComponent,
+  type VNode,
+} from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyPlan, EMPTY_STATE, type Plan, type PlanState } from '../../src/core/plan';
 import { canonicalJson, decodeRecord, MODEL_VERSION } from '../../src/core/records';
 import { createHostFacade } from '../../src/platform/facade';
+import { GoalForm } from '../../src/ui/goals/GoalForm';
 import {
   createDeferred,
   createFakeHost,
@@ -9,6 +17,7 @@ import {
   manualPlan,
   versionOf,
 } from '../fakes/fake-facade';
+import { input, openSaveStatusEditor } from '../fakes/save-status-editor';
 
 async function startHost(initial?: PlanState, hasSaveMethod = true) {
   const host = createFakeHost(initial);
@@ -210,4 +219,112 @@ it('matches applyPlan after asynchronous coalesced commits', async () => {
     sync: 'ok',
     keys: { [secondEdit.key]: { state: 'saved', savedAt: 1234, valueSha256: expectedHash } },
   });
+});
+
+interface FormElementProps {
+  readonly children?: ComponentChildren;
+  readonly disabled?: boolean;
+  readonly type?: string;
+  readonly onSubmit?: (event: Pick<Event, 'preventDefault'>) => void;
+}
+
+function* formElements(tree: ComponentChildren): Generator<VNode<FormElementProps>> {
+  for (const child of toChildArray(tree)) {
+    if (!isValidElement(child)) continue;
+    const node = child as VNode<FormElementProps>;
+    if (typeof node.type === 'function') {
+      yield* formElements((node.type as FunctionComponent<FormElementProps>)(node.props));
+    } else {
+      yield node;
+      yield* formElements(node.props.children);
+    }
+  }
+}
+
+function pressSave(form: Awaited<ReturnType<typeof openSaveStatusEditor>>['form']) {
+  const save = vi.fn(() => form.save());
+  const tree = GoalForm({
+    view: form.view(),
+    records: {},
+    input: form.input,
+    save: () => {
+      void save();
+    },
+    retry: () => {
+      void form.retry();
+    },
+    back: () => {
+      void form.leave();
+    },
+  });
+  const fields = [...formElements(tree)].find((node) => node.type === 'form');
+  const button = [...formElements(fields?.props.children)].find(
+    (node) => node.type === 'button' && node.props.type === 'submit',
+  );
+  expect(button?.props).toMatchObject({ children: 'Сохранить', disabled: false });
+  // Activating an enabled submit button runs the form's onSubmit handler.
+  fields?.props.onSubmit?.({ preventDefault: () => undefined });
+  expect(save).toHaveBeenCalledOnce();
+  return save.mock.results[0]!.value;
+}
+
+it('paces two manual saves of the same key at the two-second boundary', async () => {
+  const at = 10_000;
+  vi.useFakeTimers({ now: at });
+  const f = await openSaveStatusEditor(initial, original.key, at);
+  const handedOffAt: number[] = [];
+  f.host.beforeHandoff.mockImplementation(() => {
+    handedOffAt.push(Date.now());
+    return Promise.resolve();
+  });
+  const { form } = f;
+  const latest = { ...input, fields: { statement: 'Следующий ввод' } };
+  expect(form.input(input)).toBe(true);
+  await f.commitDrafts();
+  await pressSave(form);
+  await f.host.commitAfter(Promise.resolve());
+  const first = f.facade.apply.mock.lastCall![0].writes[0]!;
+  expect(handedOffAt).toEqual([at]);
+
+  await vi.advanceTimersByTimeAsync(100);
+  expect(form.input(latest)).toBe(true);
+  await f.commitDrafts();
+  await vi.advanceTimersByTimeAsync(1899);
+  const secondSave = pressSave(form);
+  await vi.advanceTimersByTimeAsync(0);
+  expect.soft(handedOffAt).toEqual([at]);
+
+  await vi.advanceTimersByTimeAsync(1);
+  await secondSave;
+  expect(handedOffAt).toEqual([at, at + 2000]);
+  expect(f.facade.apply.mock.lastCall![0].writes).toMatchObject([
+    { key: original.key, base: versionOf(first) },
+  ]);
+  const second = f.facade.apply.mock.lastCall![0].writes[0]!;
+  expect(decodeRecord(second.key, second.value)).toMatchObject({ ok: true, value: latest.fields });
+});
+
+it.each([
+  ['absent', undefined],
+  ['string', '10000'],
+  ['nonfinite', Number.NaN],
+  ['outside the date range', 8.64e15 + 1],
+] as const)('shows unknown and keeps the draft when receipt time is %s', async (_name, time) => {
+  const at = 10_000;
+  vi.useFakeTimers({ now: at });
+  const f = await openSaveStatusEditor(initial, original.key, at);
+  const current = await f.submit();
+  const confirmed = current.keys[original.key];
+  if (confirmed?.state !== 'saved') throw new Error('Expected a valid fixture receipt');
+  // The receipt still carries the real matching digest.
+  const malformed = { ...confirmed, savedAt: time };
+  if (time === undefined) Reflect.deleteProperty(malformed, 'savedAt');
+  f.host.api.getSyncedDataSaveState.mockResolvedValue({
+    ...current,
+    keys: { [original.key]: malformed as typeof confirmed },
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  await f.commitDrafts();
+  expect(f.disk()).toMatchObject({ fields: input.fields });
+  expect(f.form.view().message).toBe('Состояние неизвестно');
 });

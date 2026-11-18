@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Command } from '../../src/app/commands';
+import { createGoalEditor } from '../../src/app/goal-editor';
 import { applyPlan, EMPTY_STATE } from '../../src/core/plan';
+import { createDraftStore } from '../../src/platform/draft-store';
+import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
 import {
   createDeferred,
   createFakeHost,
@@ -93,8 +96,8 @@ function createBridge(host: Awaited<ReturnType<typeof startHost>>) {
           listener = callback;
         },
       });
-      const { send } = await import('../../src/platform/iframe-messaging');
-      return { deliveries, send, iframeWindow, postMessage, receive, reply };
+      const { createIframeFacade, send } = await import('../../src/platform/iframe-messaging');
+      return { deliveries, createIframeFacade, send, iframeWindow, postMessage, receive, reply };
     },
   };
 }
@@ -196,6 +199,59 @@ it('keeps applying after the iframe closes', async () => {
 
   await vi.advanceTimersByTimeAsync(30_000);
   expect(await firstResult).toBeInstanceOf(Error);
+});
+
+it('requests sync for a retry handed to the executor before the form closes', async () => {
+  const host = await startHost();
+  const view = await createBridge(host).open();
+  const database = createFakeDraftDatabase();
+  const form = createGoalEditor({
+    facade: view.createIframeFacade({}),
+    drafts: createDraftStore(database.factory),
+    now: Date.now,
+    newId: () => crypto.randomUUID(),
+  });
+  await form.open(original.key);
+  expect(form.input({ action: 'edit', fields: { statement: 'Нужно синхронизировать' } })).toBe(
+    true,
+  );
+  await form.save();
+  await host.commitAfter(view.deliveries[0]!);
+  const first = view.postMessage.mock.calls[0]?.[0].message;
+  if (first?.cmd !== 'apply') throw new Error('Expected the initial plan');
+  expect(host.api.triggerSync).not.toHaveBeenCalled();
+
+  host.api.getSyncedDataSaveState.mockResolvedValue({
+    sync: 'offline',
+    keys: { [original.key]: { state: 'pending' } },
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(form.view()).toMatchObject({ status: 'retry', busy: false });
+  host.api.loadSyncedData.mockClear();
+  const { entered, release } = holdFirstWrite(host);
+  const retry = form.retry();
+  try {
+    await Promise.race([entered.promise, retry]);
+    const repeated = view.postMessage.mock.calls[1]?.[0].message;
+    if (repeated?.cmd !== 'apply') throw new Error('Expected the retry plan');
+    const write = repeated.plan.writes[0]!;
+    expect(write).toMatchObject({ key: original.key, base: versionOf(first.plan.writes[0]!) });
+    expect(versionOf(write)).not.toBe(versionOf(first.plan.writes[0]!));
+    expect(host.api.loadSyncedData).toHaveBeenCalledWith(original.key);
+    expect(host.api.persistDataSynced).toHaveBeenLastCalledWith(write.value, write.key);
+    expect(view.reply).toHaveBeenCalledTimes(1);
+
+    form.close();
+    release.resolve();
+    await host.commitAfter(view.deliveries[1]!);
+    await retry;
+    expect(view.reply).toHaveBeenCalledTimes(2);
+    expect(host.committed().entries[write.key]).toBe(write.value);
+    expect(form.view().key).toBe('');
+    expect(host.api.triggerSync).toHaveBeenCalledOnce();
+  } finally {
+    release.resolve();
+  }
 });
 
 it('re-reads after a timed-out reply without unlocking the queue', async () => {
