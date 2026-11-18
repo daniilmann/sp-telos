@@ -179,14 +179,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b
-        with:
-          version: '1.31.1'
-          inputs: .github/workflows/plugin-api-branch-gate.yml
-          advanced-security: false
-          online-audits: false
-          token: ''
-          annotations: true
+      - name: Audit the workflow offline with zizmor
+        run: |
+          set -euo pipefail
+          zizmor_dir="$(mktemp -d "$RUNNER_TEMP/zizmor.XXXXXX")"
+          archive="$zizmor_dir/zizmor.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --output "$archive" https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            'd185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99' \
+            "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$zizmor_dir" zizmor
+          env -u GH_TOKEN -u GITHUB_TOKEN "$zizmor_dir/zizmor" --offline --format=github \
+            .github/workflows/plugin-api-branch-gate.yml
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
