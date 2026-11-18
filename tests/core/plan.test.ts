@@ -274,6 +274,29 @@ describe('checks UTF-8 size and preserves history at the limit', () => {
 });
 
 describe('rejects an invalid or forged plan', () => {
+  it('rejects the whole plan when a target value is non-canonical JSON', () => {
+    const state = applyPlan(empty, goalCreation());
+    const plan = makePlan(
+      [
+        {
+          key: annualGoalKey,
+          base: version(1),
+          record: { ...annualGoal, statement: 'Reduce wait for urgent requests' },
+        },
+        { key: objectiveKey, base: 'absent', record: objective },
+      ],
+      2,
+    );
+    expect(classifyPlan(state, plan)).toEqual({ ok: true, writes: plan.writes });
+
+    const objectiveWrite = plan.writes[1]!;
+    const nonCanonicalPlan = {
+      ...plan,
+      writes: [plan.writes[0]!, { ...objectiveWrite, value: `${objectiveWrite.value} ` }],
+    };
+    expectRejection(state, nonCanonicalPlan, 'invalid');
+  });
+
   it('rejects duplicate keys even if their writes are identical', () => {
     const plan = goalCreation();
     expectRejection(empty, { ...plan, writes: [...plan.writes, ...plan.writes] }, 'invalid');
