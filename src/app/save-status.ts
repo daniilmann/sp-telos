@@ -43,15 +43,20 @@ function interpret(
 ): SaveStatus {
   if (targets.some(({ key }) => reply.keys[key]?.state === 'failed')) return { state: 'failed' };
   if (targets.some((target) => !matchesVersion(target, snapshot))) return { state: 'replaced' };
-  const times = targets.flatMap(({ key, digest }) => {
+  const times: number[] = [];
+  for (const { key, digest } of targets) {
     const saved = reply.keys[key];
-    return saved?.state === 'saved' &&
-      saved.valueSha256 === digest &&
-      Number.isFinite(saved.savedAt) &&
-      Math.abs(saved.savedAt) <= 8.64e15
-      ? [saved.savedAt]
-      : [];
-  });
+    if (saved?.state !== 'saved') continue;
+    if (
+      typeof saved.valueSha256 !== 'string' ||
+      saved.valueSha256.length !== 64 ||
+      /[^a-f0-9]/.test(saved.valueSha256) ||
+      !Number.isFinite(saved.savedAt) ||
+      Math.abs(saved.savedAt) > 8.64e15
+    )
+      return { state: 'unknown' };
+    if (saved.valueSha256 === digest) times.push(saved.savedAt);
+  }
   if (reply.sync !== 'ok') return { state: 'retry' };
   if (times.length === targets.length) return { state: 'saved', savedAt: Math.max(...times) };
   return { state: elapsed >= 20_000 ? 'retry' : 'pending' };

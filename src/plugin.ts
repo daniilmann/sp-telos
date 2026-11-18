@@ -35,7 +35,7 @@ if (typeof PluginAPI.onMessage === 'function') {
       applying.add(requestId);
     }
     const result = tail
-      .then(() => apply(plan))
+      .then(() => apply(plan, message))
       .finally(() => {
         if (requestId !== undefined) applying.delete(requestId);
       });

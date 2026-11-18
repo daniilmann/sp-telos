@@ -1,7 +1,8 @@
-import type { Draft, DraftStore } from './draft-store';
+import { sameDraft, type Draft, type DraftStore } from './draft-store';
 import type { SaveState } from '@super-productivity/plugin-api';
+import type { Command } from '../app/commands';
 import type { Plan, PlanState } from '../core/plan';
-import { canonicalJson, decodeRecord, isUuid, RECORD_PREFIXES, WIPE_KEY } from '../core/records';
+import { decodeRecord, isUuid, RECORD_PREFIXES, WIPE_KEY } from '../core/records';
 
 export interface Facade<ApplyResult = PlanState> {
   read(): Promise<PlanState>;
@@ -17,6 +18,9 @@ export interface PlanHandoff {
   readonly total: number;
   readonly writes: Plan['writes'];
 }
+
+// The iframe adapter forwards the observer with the same handoff options it already uses.
+export type HandoffObserver = ((message: string) => void) & Pick<Command, 'forceSync'>;
 
 export function now(): number {
   return Date.now();
@@ -86,9 +90,6 @@ export function createHostFacade() {
       const readOnlyReason = snapshot.readOnlyReason ?? missingMethodsReason(missingReadMethods());
       return readOnlyReason ? { ...snapshot, readOnlyReason } : snapshot;
     },
-    triggerSync(): Promise<void> {
-      return PluginAPI.triggerSync();
-    },
     readSaveState(keys: string[]): Promise<SaveState> {
       return PluginAPI.getSyncedDataSaveState(keys);
     },
@@ -96,10 +97,9 @@ export function createHostFacade() {
 }
 
 export interface EditorFacade extends Facade<PlanHandoff> {
-  apply(plan: Plan, onIncomplete?: (message: string) => void): Promise<PlanHandoff>;
+  apply(plan: Plan, onIncomplete?: HandoffObserver): Promise<PlanHandoff>;
   read(keys?: readonly string[]): Promise<ReadSnapshot>;
   readSaveState(keys: string[]): Promise<SaveState>;
-  triggerSync(): Promise<void>;
 }
 
 export async function handoffGoalPlan(
@@ -107,9 +107,13 @@ export async function handoffGoalPlan(
   plan: Plan,
   { key, value }: Plan['writes'][number],
   onIncomplete: (message: string) => void,
+  retry: boolean,
 ) {
   try {
-    await facade.apply(plan, onIncomplete);
+    const observer = retry
+      ? Object.assign(onIncomplete, { forceSync: true as const })
+      : onIncomplete;
+    await facade.apply(plan, observer);
     return { applied: true };
   } catch (error) {
     const refreshed = await facade.read([key]).catch(() => undefined);
@@ -136,31 +140,31 @@ export async function handleDraftWipe(
   return (await drafts.flush()).ok;
 }
 
-export function sameDraft(observed: Draft | undefined, expected: Draft): boolean {
-  return (
-    observed?.baseVer === expected.baseVer &&
-    canonicalJson(observed.fields) === canonicalJson(expected.fields)
-  );
-}
-
 export async function removeConfirmedDraft(
   drafts: DraftStore,
   key: string,
   expected: Draft,
   applicable: () => boolean,
-): Promise<'removed' | 'write-failed' | 'remove-failed' | undefined> {
+): Promise<'removed' | 'skipped' | 'write-failed' | 'remove-failed' | undefined> {
   const observed = await drafts.read(key);
   if (!applicable() || (!observed.confirmedRemoval && !sameDraft(observed.value, expected)))
     return undefined;
   // Drain the pending write before removing. A later poll can revoke this proof while waiting.
   const settled = await drafts.flush();
   if (!applicable()) return undefined;
+  if (observed.confirmedRemoval?.state === 'skipped') return 'skipped';
   if (!settled.ok) return observed.confirmedRemoval ? 'remove-failed' : 'write-failed';
   const latest = await drafts.read(key);
   if (!applicable() || latest.failed) return undefined;
-  if (observed.confirmedRemoval) return latest.value === undefined ? 'removed' : undefined;
-  if (!sameDraft(latest.value, expected) || !drafts.removeConfirmed(key, applicable))
-    return undefined;
+  if (observed.confirmedRemoval)
+    return observed.confirmedRemoval.state === 'removed' && latest.value === undefined
+      ? 'removed'
+      : undefined;
+  if (!sameDraft(latest.value, expected)) return undefined;
+  const removal = drafts.removeConfirmed(key, expected, applicable);
+  if (!removal) return undefined;
   const after = await drafts.flush();
-  return after.ok ? 'removed' : 'remove-failed';
+  if (removal.state === 'skipped') return 'skipped';
+  if (!after.ok) return 'remove-failed';
+  return removal.state === 'removed' ? 'removed' : undefined;
 }

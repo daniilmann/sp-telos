@@ -1,3 +1,4 @@
+import type { Command } from '../app/commands';
 import { classifyPlan, type Plan } from '../core/plan';
 import { inspectRecords, missingMethodsReason, missingReadMethods, readRecords } from './facade';
 import type { PlanHandoff } from './facade';
@@ -31,7 +32,10 @@ const rejectionMessages = {
   'unsupported-version': 'Обновите плагин: неизвестная версия схемы плана.',
 };
 
-export async function apply(plan: Plan): Promise<PlanHandoff> {
+export async function apply(
+  plan: Plan,
+  options?: Pick<Command, 'forceSync'>,
+): Promise<PlanHandoff> {
   const { state, readOnlyReason } = await checkCompatibility(plan.writes.map(({ key }) => key));
   if (readOnlyReason) throw new Error(readOnlyReason);
 
@@ -51,5 +55,12 @@ export async function apply(plan: Plan): Promise<PlanHandoff> {
     transferred += 1;
   }
 
+  if (options?.forceSync) {
+    void Promise.resolve()
+      .then(() => PluginAPI.triggerSync())
+      .catch(() => {
+        // Save-state polling reports sync availability independently of handoff.
+      });
+  }
   return { transferred, total, writes: plan.writes };
 }

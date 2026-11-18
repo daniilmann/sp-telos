@@ -3,7 +3,8 @@ import type { ApplyingQuery, Command, CompatibilityQuery } from '../app/commands
 import {
   createHostFacade,
   newId,
-  type Facade,
+  type EditorFacade,
+  type HandoffObserver,
   type PlanHandoff,
   type ReadSnapshot,
 } from './facade';
@@ -12,7 +13,7 @@ const TIMEOUT_MS = 30_000;
 const INCOMPLETE_MS = 60_000;
 
 interface SendOptions {
-  readonly onIncomplete?: (message: string) => void;
+  readonly onIncomplete?: HandoffObserver;
   readonly onReread?: (snapshot: ReadSnapshot) => void;
 }
 
@@ -100,7 +101,14 @@ function sendRequest(
       }
     });
     try {
-      const body = message.cmd === 'apply' ? { ...message, requestId: messageId } : message;
+      const body =
+        message.cmd === 'apply'
+          ? {
+              ...message,
+              requestId: messageId,
+              ...(options.onIncomplete?.forceSync && { forceSync: true }),
+            }
+          : message;
       window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message: body }, '*');
     } catch (error) {
       pending.delete(messageId);
@@ -114,6 +122,7 @@ function sendRequest(
 export function createIframeFacade(options: SendOptions) {
   return {
     ...createHostFacade(),
-    apply: (plan) => send({ cmd: 'apply', plan }, options),
-  } satisfies Facade<PlanHandoff>;
+    apply: (plan, onIncomplete) =>
+      send({ cmd: 'apply', plan }, onIncomplete ? { ...options, onIncomplete } : options),
+  } satisfies EditorFacade;
 }

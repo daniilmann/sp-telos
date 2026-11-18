@@ -29,6 +29,7 @@ export type Command = {
   readonly cmd: 'apply';
   readonly plan: Plan;
   readonly requestId?: string;
+  readonly forceSync?: true;
 };
 export type CompatibilityQuery = { readonly cmd: 'compatibility' };
 export type ApplyingQuery = { readonly cmd: 'isApplying'; readonly requestId: string };
@@ -37,8 +38,11 @@ export function isCommand(message: unknown): message is Command {
   if (!isObject(message) || message.cmd !== 'apply' || !isPlan(message.plan)) return false;
   const keys = Object.keys(message);
   if (!keys.includes('cmd') || !keys.includes('plan')) return false;
-  if (keys.includes('requestId')) return keys.length === 3 && isUuid(message.requestId);
-  return keys.length === 2 && !('requestId' in message);
+  return (
+    (!('requestId' in message) || (keys.includes('requestId') && isUuid(message.requestId))) &&
+    (!('forceSync' in message) || (keys.includes('forceSync') && message.forceSync === true)) &&
+    keys.every((key) => ['cmd', 'plan', 'requestId', 'forceSync'].includes(key))
+  );
 }
 
 export function isApplyingQuery(message: unknown): message is ApplyingQuery {
@@ -360,6 +364,7 @@ export const leaveFailed = {
 export const failedRemoval = 'Черновик не удалён';
 export const removalMessages = {
   removed: undefined,
+  skipped: undefined,
   'write-failed': draftError,
   'remove-failed': failedRemoval,
 };

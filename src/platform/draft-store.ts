@@ -1,3 +1,5 @@
+import { canonicalJson } from '../core/records';
+
 const DATABASE_NAME = 'sp-telos-drafts';
 const STORE_NAME = 'drafts';
 const WIPE_VERSION_KEY = 'meta:last-handled-wipe';
@@ -14,8 +16,12 @@ export interface Draft {
 export type DraftRead = {
   readonly value: Draft | undefined;
   readonly failed: boolean;
-  readonly confirmedRemoval?: true;
+  readonly confirmedRemoval?: Readonly<RemovalOutcome>;
 };
+
+interface RemovalOutcome {
+  state: 'pending' | 'removed' | 'skipped';
+}
 
 export type FlushResult =
   | { readonly ok: true }
@@ -26,7 +32,11 @@ export interface DraftStore {
   list(): Promise<{ readonly keys: readonly string[]; readonly failed: boolean }>;
   write(key: string, draft: Draft): void;
   remove(key: string): void;
-  removeConfirmed(key: string, stillConfirmed: () => boolean): boolean;
+  removeConfirmed(
+    key: string,
+    expected: Draft,
+    stillConfirmed: () => boolean,
+  ): Readonly<RemovalOutcome> | undefined;
   flush(): Promise<FlushResult>;
   readWipeVersion(): Promise<string | undefined>;
   writeWipeVersion(version: string): void;
@@ -37,9 +47,22 @@ type Value = Draft | string | undefined;
 
 interface Pending {
   readonly value: Value;
-  readonly stillConfirmed: (() => boolean) | undefined;
+  readonly removal: ConfirmedRemoval | undefined;
   failed: boolean;
   running: boolean;
+}
+
+interface ConfirmedRemoval {
+  readonly expected: Draft;
+  readonly stillConfirmed: () => boolean;
+  readonly outcome: RemovalOutcome;
+}
+
+export function sameDraft(observed: Draft | undefined, expected: Draft): boolean {
+  return (
+    observed?.baseVer === expected.baseVer &&
+    canonicalJson(observed.fields) === canonicalJson(expected.fields)
+  );
 }
 
 function openDatabase(factory: Factory | undefined, invalidate: () => void): Promise<IDBDatabase> {
@@ -113,18 +136,37 @@ function putDraft(
   };
 }
 
-function mutate(database: IDBDatabase, key: string, value: Value): Promise<void> {
+function mutate(
+  database: IDBDatabase,
+  key: string,
+  { value, removal }: Pending,
+  applicable: () => boolean,
+): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(STORE_NAME, 'readwrite');
+    let removed = false;
     transaction.oncomplete = () => {
-      resolve();
+      resolve(removed);
     };
     // Failed requests abort the transaction by default.
     transaction.onabort = () => {
       reject(transaction.error ?? new Error('Draft write aborted'));
     };
     const store = transaction.objectStore(STORE_NAME);
-    if (value === undefined) store.delete(key);
+    if (removal) {
+      // A separate connection can commit a new draft before this transaction starts.
+      const stored: IDBRequest<unknown> = store.get(key);
+      stored.onsuccess = () => {
+        try {
+          const observed = stored.result;
+          if (!isDraft(observed) || !sameDraft(observed, removal.expected) || !applicable()) return;
+          store.delete(key);
+          removed = true;
+        } catch {
+          transaction.abort();
+        }
+      };
+    } else if (value === undefined) store.delete(key);
     else if (typeof value === 'string') store.put(value, key);
     else putDraft(transaction, store, key, value);
   });
@@ -168,19 +210,22 @@ export function createDraftStore(factory?: Factory): DraftStore {
 
   async function persist(key: string, attempted: Pending): Promise<void> {
     attempted.running = true;
+    const { removal } = attempted;
+    const applicable = () => pending.get(key) === attempted && removal?.stillConfirmed() === true;
     try {
       const connected = await database();
       // Opening the database can outlast both the confirmation and a flush deadline.
-      if (
-        !attempted.stillConfirmed ||
-        (pending.get(key) === attempted && attempted.stillConfirmed())
-      )
-        await mutate(connected, key, attempted.value);
+      const removed =
+        (!removal || applicable()) && (await mutate(connected, key, attempted, applicable));
+      if (removal) removal.outcome.state = removed ? 'removed' : 'skipped';
     } catch {
       const latest = pending.get(key);
-      if (latest === attempted && attempted.stillConfirmed?.() === false) {
-        pending.delete(key);
-      } else if (latest) {
+      const revoked = latest === attempted && removal?.stillConfirmed() === false;
+      if (removal && (revoked || latest !== attempted)) {
+        removal.outcome.state = 'skipped';
+      }
+      if (revoked) pending.delete(key);
+      else if (latest) {
         latest.running = false;
         latest.failed = true;
       }
@@ -198,11 +243,12 @@ export function createDraftStore(factory?: Factory): DraftStore {
     checkFlush?.();
   }
 
-  function enqueue(key: string, value: Value, stillConfirmed?: () => boolean): void {
+  function enqueue(key: string, value: Value, removal?: ConfirmedRemoval): void {
     const previous = pending.get(key);
+    if (previous?.removal && !previous.running) previous.removal.outcome.state = 'skipped';
     const intent = {
       value,
-      stillConfirmed,
+      removal,
       failed: previous?.failed ?? false,
       running: previous?.running ?? false,
     };
@@ -246,7 +292,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
 
   function visibleIntent(key: string): Pending | undefined {
     const intent = pending.get(key);
-    return intent?.stillConfirmed?.() === false ? undefined : intent;
+    return intent?.removal?.stillConfirmed() === false ? undefined : intent;
   }
 
   function readIntent(intent: Pending | undefined, failed = intent?.failed ?? false): DraftRead {
@@ -254,7 +300,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
     return {
       value: isDraft(value) ? structuredClone(value) : undefined,
       failed,
-      ...(intent?.stillConfirmed && { confirmedRemoval: true }),
+      ...(intent?.removal && { confirmedRemoval: intent.removal.outcome }),
     };
   }
 
@@ -286,7 +332,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
         keys.filter((key): key is string => typeof key === 'string' && key !== WIPE_VERSION_KEY),
       );
       for (const [key, intent] of pending) {
-        if (key === WIPE_VERSION_KEY || intent.stillConfirmed?.() === false) continue;
+        if (key === WIPE_VERSION_KEY || intent.removal?.stillConfirmed() === false) continue;
         if (intent.value === undefined) drafts.delete(key);
         else drafts.add(key);
       }
@@ -300,11 +346,12 @@ export function createDraftStore(factory?: Factory): DraftStore {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
       enqueue(key, undefined);
     },
-    removeConfirmed(key, stillConfirmed) {
+    removeConfirmed(key, expected, stillConfirmed) {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
-      if (pending.has(key)) return false;
-      enqueue(key, undefined, stillConfirmed);
-      return true;
+      if (pending.has(key)) return undefined;
+      const outcome: RemovalOutcome = { state: 'pending' };
+      enqueue(key, undefined, { expected, stillConfirmed, outcome });
+      return outcome;
     },
     async readWipeVersion() {
       const intent = pending.get(WIPE_VERSION_KEY);

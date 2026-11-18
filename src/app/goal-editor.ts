@@ -1,9 +1,8 @@
-import type { Draft } from '../platform/draft-store';
+import { sameDraft, type Draft } from '../platform/draft-store';
 import {
   handleDraftWipe,
   handoffGoalPlan,
   removeConfirmedDraft,
-  sameDraft,
   type ReadSnapshot,
 } from '../platform/facade';
 import {
@@ -32,6 +31,8 @@ import {
 } from './commands';
 import { createSaveStatus, saveMessage } from './save-status';
 
+const EDIT_INTERVAL_MS = 2000;
+
 export function createGoalEditor({
   facade,
   drafts,
@@ -48,8 +49,10 @@ export function createGoalEditor({
   let handoffVer: string | undefined;
   let confirmation: { readonly sent: Submission; readonly draft: Draft } | undefined;
   let removing: typeof confirmation;
-  let autoSave: ReturnType<typeof setTimeout> | undefined;
-  let lastSent = -Infinity;
+  let scheduledSave:
+    | { readonly timer: ReturnType<typeof setTimeout>; readonly cancel: () => void }
+    | undefined;
+  const lastSentByKey = new Map<string, number>();
   let dirty = false;
   const status = createSaveStatus({
     read: (keys) => facade.read(keys),
@@ -120,13 +123,15 @@ export function createGoalEditor({
     status.invalidate(formId, generation);
   }
 
-  function cancelAutoSave(): void {
-    clearTimeout(autoSave);
-    autoSave = undefined;
+  function cancelScheduledSave(): void {
+    if (!scheduledSave) return;
+    clearTimeout(scheduledSave.timer);
+    scheduledSave.cancel();
+    scheduledSave = undefined;
   }
 
   function close(): void {
-    cancelAutoSave();
+    cancelScheduledSave();
     status.close(formId);
     formId = '';
     submission = undefined;
@@ -154,22 +159,28 @@ export function createGoalEditor({
     }
   }
 
+  function editingText(): boolean {
+    return view.intent.action === 'create' || view.intent.action === 'edit';
+  }
+
+  function remainingDelay(): number {
+    const lastSent = lastSentByKey.get(view.key);
+    return lastSent === undefined ? 0 : Math.max(0, lastSent + EDIT_INTERVAL_MS - now());
+  }
+
+  function delaySave(delay: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        scheduledSave = undefined;
+        resolve(save());
+      }, delay);
+      scheduledSave = { timer, cancel: resolve };
+    });
+  }
+
   function scheduleSave(): void {
-    if (
-      autoSave !== undefined ||
-      view.busy ||
-      view.draftChoices ||
-      view.wipe ||
-      (view.intent.action !== 'create' && view.intent.action !== 'edit')
-    )
-      return;
-    autoSave = setTimeout(
-      () => {
-        autoSave = undefined;
-        void save();
-      },
-      now() < lastSent + 2000 ? lastSent + 2000 - now() : 2000,
-    );
+    if (scheduledSave || view.busy || view.draftChoices || view.wipe || !editingText()) return;
+    void delaySave(remainingDelay() || EDIT_INTERVAL_MS);
   }
 
   async function checkDraft(): Promise<void> {
@@ -182,7 +193,7 @@ export function createGoalEditor({
 
   function input(intent: GoalIntent): boolean {
     if (!view.ready || view.readOnly || view.draftChoices || view.wipe) return false;
-    if (intent.action === 'close' || intent.action === 'revise') cancelAutoSave();
+    if (intent.action === 'close' || intent.action === 'revise') cancelScheduledSave();
     invalidate();
     dirty = true;
     update({ ...updatedInput, intent });
@@ -201,7 +212,12 @@ export function createGoalEditor({
     )
       return;
     if (!retry && submission?.generation === generation) return;
-    cancelAutoSave();
+    cancelScheduledSave();
+    const delay = !retry && editingText() ? remainingDelay() : 0;
+    return delay > 0 ? delaySave(delay) : submit(retry);
+  }
+
+  async function submit(retry: boolean): Promise<void> {
     const { key, baseVer, intent } = view;
     const id = formId;
     const epoch = generation;
@@ -248,18 +264,23 @@ export function createGoalEditor({
       const { plan, write } = prepared;
       const sent = { write, generation: epoch };
       submission = sent;
-      lastSent = now();
+      lastSentByKey.set(key, now());
       update({ status: 'pending', message: 'Сохраняется…' });
-      const result = await handoffGoalPlan(facade, plan, write, (deadline) => {
-        if (currentForm() && submission === sent && view.status !== 'saved') update({ deadline });
-      });
+      const result = await handoffGoalPlan(
+        facade,
+        plan,
+        write,
+        (deadline) => {
+          if (currentForm() && submission === sent && view.status !== 'saved') update({ deadline });
+        },
+        retry,
+      );
       if (formId !== id) return;
       if (result.applied) acceptHandoff(write, baseVer, snapshot, currentForm());
       if (!currentForm()) return;
       await status.track({ formId: id, generation: epoch, planId: newId() }, plan);
       if (!currentForm()) return;
       if (result.message) update({ status: 'unknown', message: result.message });
-      if (retry) await facade.triggerSync();
     } catch {
       if (currentForm()) update({ status: 'unknown', message: 'Состояние неизвестно' });
     } finally {
