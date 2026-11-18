@@ -1,0 +1,284 @@
+const DATABASE_NAME = 'sp-telos-drafts';
+const STORE_NAME = 'drafts';
+const WIPE_VERSION_KEY = 'meta:last-handled-wipe';
+const BYTE_LIMIT = 1024 * 1024;
+const FLUSH_TIMEOUT_MS = 5000;
+const encoder = new TextEncoder();
+
+export interface Draft {
+  readonly fields: Readonly<Record<string, unknown>>;
+  readonly baseVer: string;
+  readonly at: number;
+}
+
+export type DraftRead = { readonly value: Draft | undefined; readonly failed: boolean };
+
+export type FlushResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: 'failed' | 'timeout'; readonly keys: readonly string[] };
+
+export interface DraftStore {
+  read(key: string): Promise<DraftRead>;
+  list(): Promise<readonly string[]>;
+  write(key: string, draft: Draft): void;
+  remove(key: string): void;
+  flush(): Promise<FlushResult>;
+  readWipeVersion(): Promise<string | undefined>;
+  writeWipeVersion(version: string): void;
+}
+
+type Factory = Pick<IDBFactory, 'open'>;
+type Value = Draft | string | undefined;
+
+interface Pending {
+  readonly value: Value;
+  failed: boolean;
+  running: boolean;
+}
+
+function openDatabase(factory: Factory | undefined, invalidate: () => void): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = (factory ?? indexedDB).open(DATABASE_NAME, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(STORE_NAME);
+    };
+    request.onerror = () => {
+      reject(request.error ?? new Error('Draft database open failed'));
+    };
+    request.onblocked = () => {
+      request.onsuccess = () => {
+        request.result.close();
+      };
+      reject(new Error('Draft database open is blocked'));
+    };
+    request.onsuccess = () => {
+      const database = request.result;
+      database.onclose = invalidate;
+      database.onversionchange = () => {
+        database.close();
+        invalidate();
+      };
+      resolve(database);
+    };
+  });
+}
+
+function isDraft(value: unknown): value is Draft {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'fields' in value &&
+    value.fields !== null &&
+    typeof value.fields === 'object' &&
+    'baseVer' in value &&
+    typeof value.baseVer === 'string' &&
+    'at' in value &&
+    typeof value.at === 'number'
+  );
+}
+
+function draftBytes(value: unknown): number {
+  // The other stored value is the wipe version, a string outside the draft budget.
+  return value === undefined || typeof value === 'string'
+    ? 0
+    : encoder.encode(JSON.stringify(value)).byteLength;
+}
+
+function putDraft(
+  transaction: IDBTransaction,
+  store: IDBObjectStore,
+  key: string,
+  draft: Draft,
+): void {
+  // Overlapping readwrite transactions on this store run serially, even across connections.
+  const rows: IDBRequest<unknown[]> = store.getAll();
+  const previous: IDBRequest<unknown> = store.get(key);
+  previous.onsuccess = () => {
+    try {
+      const total = rows.result.reduce<number>((sum, row) => sum + draftBytes(row), 0);
+      if (total - draftBytes(previous.result) + draftBytes(draft) <= BYTE_LIMIT) {
+        store.put(draft, key);
+        return;
+      }
+    } catch {
+      // Serialization or a synchronous put error also leaves the intent pending.
+    }
+    transaction.abort();
+  };
+}
+
+function mutate(database: IDBDatabase, key: string, value: Value): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    transaction.oncomplete = () => {
+      resolve();
+    };
+    // Failed requests abort the transaction by default.
+    transaction.onabort = () => {
+      reject(transaction.error ?? new Error('Draft write aborted'));
+    };
+    const store = transaction.objectStore(STORE_NAME);
+    if (value === undefined) store.delete(key);
+    else if (typeof value === 'string') store.put(value, key);
+    else putDraft(transaction, store, key, value);
+  });
+}
+
+function query<T>(
+  database: IDBDatabase,
+  request: (store: IDBObjectStore) => IDBRequest<T>,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readonly');
+    transaction.onabort = () => {
+      reject(transaction.error ?? new Error('Draft read aborted'));
+    };
+    const result = request(transaction.objectStore(STORE_NAME));
+    transaction.oncomplete = () => {
+      resolve(result.result);
+    };
+  });
+}
+
+export function createDraftStore(factory?: Factory): DraftStore {
+  const pending = new Map<string, Pending>();
+  let connection: Promise<IDBDatabase> | undefined;
+  let activeFlush: Promise<FlushResult> | undefined;
+  let checkFlush: (() => void) | undefined;
+
+  function database(): Promise<IDBDatabase> {
+    if (connection) return connection;
+    const opening = openDatabase(factory, invalidate).catch((error: unknown) => {
+      invalidate();
+      throw error;
+    });
+    connection = opening;
+    return opening;
+
+    function invalidate(): void {
+      if (connection === opening) connection = undefined;
+    }
+  }
+
+  async function persist(key: string, attempted: Pending): Promise<void> {
+    attempted.running = true;
+    try {
+      await mutate(await database(), key, attempted.value);
+    } catch {
+      const latest = pending.get(key);
+      if (latest) {
+        latest.running = false;
+        latest.failed = true;
+      }
+      checkFlush?.();
+      return;
+    }
+
+    const latest = pending.get(key);
+    // A later intent may have the same value, but only this exact attempt was committed.
+    if (latest === attempted) pending.delete(key);
+    else if (latest) {
+      latest.failed = false;
+      void persist(key, latest);
+    }
+    checkFlush?.();
+  }
+
+  function enqueue(key: string, value: Value): void {
+    const previous = pending.get(key);
+    const intent = {
+      value,
+      failed: previous?.failed ?? false,
+      running: previous?.running ?? false,
+    };
+    pending.set(key, intent);
+    if (!intent.running) void persist(key, intent);
+  }
+
+  function flush(): Promise<FlushResult> {
+    // Concurrent calls share the same deadline and retry each failed key once.
+    if (activeFlush) return activeFlush;
+    if (pending.size === 0) return Promise.resolve({ ok: true });
+
+    activeFlush = new Promise((resolve) => {
+      const finish = (result: FlushResult): void => {
+        clearTimeout(timer);
+        checkFlush = undefined;
+        activeFlush = undefined;
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        finish({ ok: false, reason: 'timeout', keys: [...pending.keys()] });
+      }, FLUSH_TIMEOUT_MS);
+
+      checkFlush = () => {
+        if (pending.size === 0) {
+          finish({ ok: true });
+          return;
+        }
+        const failed = [...pending]
+          .filter(([, intent]) => intent.failed && !intent.running)
+          .map(([key]) => key);
+        if (failed.length > 0) finish({ ok: false, reason: 'failed', keys: failed });
+      };
+
+      for (const [key, intent] of pending) {
+        if (intent.failed && !intent.running) void persist(key, intent);
+      }
+    });
+    return activeFlush;
+  }
+
+  function readIntent(intent: Pending): DraftRead {
+    return { value: isDraft(intent.value) ? intent.value : undefined, failed: intent.failed };
+  }
+
+  return {
+    flush,
+    async read(key) {
+      const intent = pending.get(key);
+      if (intent) return readIntent(intent);
+
+      try {
+        const value = await query<unknown>(await database(), (store) => store.get(key));
+        const latest = pending.get(key);
+        if (latest) return readIntent(latest);
+        if (value === undefined || isDraft(value)) return { value, failed: false };
+        return { value: undefined, failed: true };
+      } catch {
+        const value = pending.get(key)?.value;
+        return { value: isDraft(value) ? value : undefined, failed: true };
+      }
+    },
+    async list() {
+      const keys = await query(await database(), (store) => store.getAllKeys());
+      const drafts = new Set(
+        keys.filter((key): key is string => typeof key === 'string' && key !== WIPE_VERSION_KEY),
+      );
+      for (const [key, intent] of pending) {
+        if (key === WIPE_VERSION_KEY) continue;
+        if (intent.value === undefined) drafts.delete(key);
+        else drafts.add(key);
+      }
+      return [...drafts];
+    },
+    write(key, draft) {
+      if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
+      enqueue(key, draft);
+    },
+    remove(key) {
+      if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
+      enqueue(key, undefined);
+    },
+    async readWipeVersion() {
+      const intent = pending.get(WIPE_VERSION_KEY);
+      if (intent && typeof intent.value === 'string') return intent.value;
+      const stored = await query<unknown>(await database(), (store) => store.get(WIPE_VERSION_KEY));
+      const value = pending.get(WIPE_VERSION_KEY)?.value ?? stored;
+      return typeof value === 'string' ? value : undefined;
+    },
+    writeWipeVersion(version) {
+      enqueue(WIPE_VERSION_KEY, version);
+    },
+  };
+}
