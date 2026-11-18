@@ -10,7 +10,7 @@ permissions:
 
 env:
   FORK_SHA: aab7f62ec24206e378595b2b82d9764d204504d7
-  PLUGIN_SHA: ee9758311f12a5bed74285f6c0a401540d069a59
+  PLUGIN_SHA: 10d470b7d462daabf88c97a235d9ff789256d9e1
   TYPES_RUN_ID: '44329171660'
   TYPES_ARTIFACT_ID: '14439250082'
   TYPES_SHA256: 5856e5dd5157f651cf63ddc530deb14e2a51d4adcd702bc011409a631757193f
@@ -110,8 +110,8 @@ jobs:
             const first = await stand.newProfile();
             const second = await stand.newProfile();
             expect(first.context).not.toBe(second.context);
-            await stand.connectSync(first);
-            await stand.connectSync(second);
+            await test.step('Configure the first profile', () => stand.connectSync(first));
+            await test.step('Configure the second profile', () => stand.connectSync(second));
             for (const profile of [first, second]) {
               await expect(profile.frame.getByRole('heading', { name: 'Цели и результаты' })).toBeVisible();
               const reply = await profile.frame.locator('body').evaluate(async () =>
