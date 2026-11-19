@@ -13,9 +13,9 @@ defaults:
     shell: bash
 
 env:
-  FORK_SHA: 82c57c4198ac5cbb383e3a90a9c4725a578c9897
+  FORK_SHA: 8a861d9dca2a900370ba24439a8f088d84fee090
   PACKAGE_NAME: '@super-productivity/plugin-api'
-  PACKAGE_VERSION: 20.0.0-fork.5
+  PACKAGE_VERSION: 20.0.0-fork.6
   HUSKY: '0'
 
 jobs:
