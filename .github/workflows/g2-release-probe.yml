@@ -1,0 +1,64 @@
+name: G2 published build probes
+
+on:
+  push:
+    branches:
+      - codex/probe-g2-published-ebfe0c76e2
+
+permissions:
+  contents: read
+
+env:
+  HUSKY: '0'
+  PLUGIN_RELEASE_SHA: ebfe0c76e2e553753b3bd4805f369b89aaa9567f
+
+jobs:
+  published:
+    if: github.repository == 'daniilmann/sp-telos' && !github.event.deleted && !github.event.forced
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check the release-parent and the probe-only paths
+        run: |
+          set -euo pipefail
+          [[ "$PLUGIN_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-list --parents -1 HEAD)" == "$GITHUB_SHA $PLUGIN_RELEASE_SHA" ]]
+          expected="$(printf 'A\t%s\n' \
+            .github/g2-release-probe/compose.yml \
+            .github/g2-release-probe/g2.spec.ts.in \
+            .github/g2-release-probe/playwright.config.ts.in \
+            .github/g2-release-probe/run.sh \
+            .github/g2-release-probe/stand.ts.in \
+            .github/workflows/g2-release-probe.yml)"
+          [[ "$(git diff --name-status --no-renames "$PLUGIN_RELEASE_SHA" "$GITHUB_SHA")" == "$expected" ]]
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Set up checksum-verified npm 11.18.0
+        run: |
+          set -euo pipefail
+          npm_dir="$(mktemp -d "$RUNNER_TEMP/g2-npm.XXXXXX")"
+          archive="$npm_dir/npm.tgz"
+          curl --disable --fail --silent --show-error --location --proto '=https' --max-time 120 \
+            --output "$archive" https://registry.npmjs.org/npm/-/npm-11.18.0.tgz
+          printf '%s  %s\n' \
+            '4faecce0be70366d1c67b1012c4adc1246354a6cc45bf589f92003073b05518d547403df1475c542d67a4845e22b4fafcd7cac0af02c7a96cc6814f09eb003fb' \
+            "$archive" | sha512sum --check -
+          tar -xzf "$archive" -C "$npm_dir" --strip-components=1
+          mkdir "$npm_dir/shims"
+          ln -s "$npm_dir/bin/npm-cli.js" "$npm_dir/shims/npm"
+          ln -s "$npm_dir/bin/npx-cli.js" "$npm_dir/shims/npx"
+          printf '%s\n' "$npm_dir/shims" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: npm exec -- playwright install --with-deps chromium
+      - name: Check the published bytes and run both probes
+        run: bash .github/g2-release-probe/run.sh "$PLUGIN_RELEASE_SHA"
