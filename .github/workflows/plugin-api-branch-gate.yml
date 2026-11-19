@@ -13,7 +13,7 @@ defaults:
     shell: bash
 
 env:
-  FORK_SHA: 8a861d9dca2a900370ba24439a8f088d84fee090
+  FORK_SHA: 41202d578128a2117e245e108b940f6a31e9b6e2
   PACKAGE_NAME: '@super-productivity/plugin-api'
   PACKAGE_VERSION: 20.0.0-fork.6
   HUSKY: '0'
