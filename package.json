@@ -17,7 +17,7 @@
     "test:e2e": "playwright test -c tests/e2e/playwright.config.ts"
   },
   "dependencies": {
-    "@super-productivity/plugin-api": "https://github.com/daniilmann/super-productivity/releases/download/v20.0.0-fork.4/super-productivity-plugin-api-20.0.0-fork.4.tgz",
+    "@super-productivity/plugin-api": "https://github.com/daniilmann/super-productivity/releases/download/v20.0.0-fork.6/super-productivity-plugin-api-20.0.0-fork.6.tgz",
     "preact": "11.2.0"
   },
   "devDependencies": {
