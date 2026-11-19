@@ -1,0 +1,145 @@
+import { randomUUID } from 'node:crypto';
+import type { FrameLocator, Page } from '@playwright/test';
+import { expect, installPlugin, isSyncOps, test } from './stand';
+
+const labels = {
+  title: 'Формулировка',
+  baseline: 'Исходное значение',
+  source: 'Источник данных',
+  target: 'Целевое значение',
+};
+const angularConfig = 'http://127.0.0.1:47173/#/config';
+
+async function create(
+  frame: FrameLocator,
+  kind: string,
+  title: string,
+  fillDetails?: () => Promise<void>,
+) {
+  const heading = frame.getByRole('heading', { name: kind, exact: true });
+  await expect(heading).toBeVisible();
+  const section = frame.locator('section').filter({ has: heading });
+  await section.getByRole('button', { name: 'Создать', exact: true }).click();
+  await frame.getByLabel(labels.title).fill(title);
+  await fillDetails?.();
+  const save = frame.getByRole('button', { name: 'Сохранить', exact: true });
+  await save.click();
+  await expect(frame.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  await expect(save).toBeDisabled();
+}
+
+async function back(frame: FrameLocator) {
+  await frame.getByRole('button', { name: 'К списку', exact: true }).click();
+}
+
+async function readKr(frame: FrameLocator) {
+  return frame.locator('body').evaluate(async () => {
+    const keys = await PluginAPI.listSyncedDataKeys('kr:');
+    return Promise.all(keys.map(async (key) => ({ key, raw: await PluginAPI.loadSyncedData(key) })));
+  });
+}
+
+test('PR-4 released .6 preserves a local KR through Remove all uploaded plugins and reupload', async ({ stand }) => {
+  const { frame, page } = await stand.newProfile();
+  const annual = 'PR4 annual ' + randomUUID();
+  const objective = 'PR4 objective ' + randomUUID();
+  const title = 'PR4 KR ' + randomUUID();
+  await create(frame, 'Годовые цели', annual);
+  await back(frame);
+  await create(frame, 'Objectives', objective, async () => {
+    await frame.getByLabel('Квартал').fill('Q2');
+    await frame.getByLabel('Годовая цель', { exact: true }).selectOption({ label: annual });
+  });
+  await back(frame);
+  await create(frame, 'Ключевые результаты', title, async () => {
+    await frame.getByLabel('Objective', { exact: true }).selectOption({ label: objective });
+    await frame.getByLabel(labels.baseline).fill('45%');
+    await frame.getByLabel(labels.source).fill('Synthetic survey');
+    await frame.getByLabel(labels.target).fill('60%');
+  });
+  const original = await readKr(frame);
+  expect(original).toHaveLength(1);
+  const raw = original[0]?.raw;
+  if (typeof raw !== 'string') throw new Error('Expected the saved record before uninstalling code');
+  expect(JSON.parse(raw)).toMatchObject({
+    statement: title,
+    baseline: '45%',
+    dataSource: 'Synthetic survey',
+    target: '60%',
+    status: 'active',
+  });
+
+  await page.goto(angularConfig);
+  await page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("extension"))').click();
+  const manager = page.locator('plugin-management');
+  const card = manager.locator('mat-card').filter({ hasText: 'SP Telos' });
+  await expect(card).toBeVisible();
+  const remove = 'Remove all uploaded plugins';
+  await manager.getByRole('button', { name: remove, exact: true }).click();
+  await page.locator('dialog-confirm button[e2e="confirmBtn"]').click();
+  await expect(card).toHaveCount(0);
+  const zip = process.env.SP_TELOS_E2E_PLUGIN_ZIP;
+  if (!zip) throw new Error('Set SP_TELOS_E2E_PLUGIN_ZIP to the published plugin ZIP');
+  await installPlugin(page, zip);
+  const reloaded = await stand.openPlugin(page);
+  await reloaded.getByRole('button', { name: title, exact: true }).click();
+  await expect(reloaded.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  expect(await readKr(reloaded)).toEqual(original);
+});
+
+function task(page: Page, title: string) {
+  return page.locator('task').filter({ has: page.getByText(title, { exact: true }) });
+}
+
+async function closeGlobalAddTaskBar(page: Page) {
+  const backdrop = page.locator('app-root > div.backdrop');
+  if (await backdrop.isVisible()) {
+    // The composer sits above the backdrop near the header. Use an exposed
+    // corner to activate the application's own backdrop dismissal handler.
+    await backdrop.click({ position: { x: 16, y: 16 }, timeout: 5_000 });
+  }
+  await expect(backdrop).toBeHidden();
+}
+
+async function addTask(page: Page, title: string) {
+  const input = page.locator('add-task-bar.global .main-input').first();
+  if (!(await input.isVisible())) await page.locator('.tour-addBtn').click();
+  await input.fill(title);
+  await page.locator('.e2e-add-task-submit').click();
+  await expect(task(page, title)).toHaveCount(1);
+  await expect(task(page, title)).toBeVisible();
+  await closeGlobalAddTaskBar(page);
+}
+
+async function checkRemote(source: Page, destination: Page, title: string) {
+  await expect(task(destination, title)).toHaveCount(0);
+  const upload = source.waitForResponse(
+    (response) => response.ok() && isSyncOps(response.request(), 'POST'),
+    { timeout: 25_000 },
+  );
+  const observe = destination.waitForResponse(
+    (response) => response.ok() && isSyncOps(response.request(), 'GET'),
+    { timeout: 35_000 },
+  );
+  await Promise.all([
+    observe,
+    (async () => {
+      await Promise.all([upload, addTask(source, title)]);
+      if (!(await task(destination, title).isVisible())) {
+        await closeGlobalAddTaskBar(destination);
+        await destination.locator('button.sync-btn').click({ timeout: 8_000 });
+      }
+      await expect(task(destination, title)).toHaveCount(1, { timeout: 20_000 });
+      await expect(task(destination, title)).toBeVisible();
+    })(),
+  ]);
+}
+
+test('PR-7 released .4 and .6 exchange core tasks in both directions', async ({ stand }) => {
+  test.setTimeout(180_000);
+  if (!process.env.SP_TELOS_E2E_OLD_WEB_DIR) throw new Error('Set SP_TELOS_E2E_OLD_WEB_DIR to the published .4 web build');
+  const previous = await stand.newSyncHost('previous');
+  const current = await stand.newSyncHost('current');
+  await checkRemote(previous, current, 'PR7 from fork 4 ' + randomUUID());
+  await checkRemote(current, previous, 'PR7 from fork 6 ' + randomUUID());
+});
