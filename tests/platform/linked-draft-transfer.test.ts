@@ -99,7 +99,7 @@ async function fixture(local: Draft = source) {
   expect(form.view().draftChoices).toContain('restore-as-new');
   const restore = (): Promise<void> => {
     const choice: Parameters<typeof form.resolveDraft>[0] = 'restore-as-new';
-    return Reflect.apply(form.resolveDraft, form, [choice, to]) as Promise<void>;
+    return form.resolveDraft(choice, to);
   };
   return {
     host,
