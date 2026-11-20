@@ -11,6 +11,7 @@ import {
   inboxId,
   initiativeKey,
   keys,
+  linkedPicker,
   openLinked,
   openRow,
   project,
@@ -33,6 +34,7 @@ import { expect, test } from './stand';
 test('Mark a project and reopen the same initiative', async ({ stand }) => {
   const profile = await stand.newProfile();
   await ready(profile);
+  await linkedPicker(profile, 'Проект');
   const goals = await seedGoals(profile);
   const projectId = await project(profile, 'Product research');
   const taskId = await task(profile, 'Interview users', projectId);

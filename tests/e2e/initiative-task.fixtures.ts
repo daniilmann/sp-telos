@@ -123,10 +123,27 @@ export async function tag(profile: StandProfile, title: string) {
 }
 
 export async function task(profile: StandProfile, title: string, projectId = inboxId) {
-  const id = await form(profile).evaluate(
-    (_body, data) => PluginAPI.addTask({ ...data, isIgnoreShortSyntax: true }),
-    { title, projectId },
-  );
+  let id: string;
+  try {
+    id = await form(profile).evaluate(
+      (_body, data) => PluginAPI.addTask({ ...data, isIgnoreShortSyntax: true }),
+      { title, projectId },
+    );
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('API call timeout')) throw error;
+    // The host can commit a create before the iframe loses its reply.
+    const matching = await form(profile).evaluate(
+      async (_body, { title, projectId }) => {
+        const state = await PluginAPI.getAppState();
+        return Object.values(state.tasks).filter(
+          (entry) => entry.title === title && entry.projectId === projectId,
+        );
+      },
+      { title, projectId },
+    );
+    if (matching.length !== 1) throw error;
+    id = matching[0]!.id;
+  }
   await expect(async () => {
     expect(await findTask(profile, id)).toMatchObject({ id, title, projectId });
   }).toPass({ timeout: 35_000 });
@@ -182,13 +199,17 @@ export async function openLinked(
 }
 
 export async function pickLinked(profile: StandProfile, label: 'Проект' | 'Задача', title: string) {
+  await choose(await linkedPicker(profile, label), title);
+  await expect(button(profile.frame, 'Сохранить')).toBeVisible();
+}
+
+export async function linkedPicker(profile: StandProfile, label: 'Проект' | 'Задача') {
   const select = field(profile.frame, label);
   await expect(
     select,
     'The installed ZIP exposes the ' + label + ' reference picker',
   ).toBeVisible();
-  await choose(select, title);
-  await expect(button(profile.frame, 'Сохранить')).toBeVisible();
+  return select;
 }
 
 export async function openRow(stand: Stand, profile: StandProfile, title: string) {
