@@ -321,3 +321,76 @@ describe('key-results', () => {
     expect(edited.value).toStrictEqual(expected);
   });
 });
+
+describe('Assign change and clear a sphere', () => {
+  const sphereTagKey = 'tag:Release';
+  const secondSphereTagKey = 'tag:Quality';
+  const available = new Set([sphereTagKey, secondSphereTagKey]);
+  const closure = { outcome: 'completed', closureReason: 'The review is complete' } as const;
+  const closedAnnualGoal = { ...annualGoal, ...closure, status: 'closed' } as const;
+  const closedObjective = { ...objective, ...closure, status: 'closed' } as const;
+
+  it.each([closedAnnualGoal, closedObjective])(
+    'changes only the sphere of a closed $kind',
+    async (record) => {
+      const { setGoalSphere } = await import('../../src/core/initiative-task-links');
+      const assigned = setGoalSphere(record, sphereTagKey, available);
+      expect(assigned).toStrictEqual({ ok: true, value: { ...record, sphereTagKey } });
+      assert(assigned.ok);
+
+      const changed = setGoalSphere(
+        assigned.value,
+        secondSphereTagKey,
+        new Set([secondSphereTagKey]),
+      );
+      expect(changed).toStrictEqual({
+        ok: true,
+        value: { ...record, sphereTagKey: secondSphereTagKey },
+      });
+      assert(changed.ok);
+
+      const unavailable = setGoalSphere(changed.value, 'tag:Missing', available);
+      expect(unavailable).toMatchObject({
+        ok: false,
+        errors: expect.arrayContaining([expect.objectContaining({ field: 'sphereTagKey' })]),
+      });
+      expect(unavailable).not.toHaveProperty('value');
+      expect(setGoalSphere(changed.value, null, new Set<string>())).toStrictEqual({
+        ok: true,
+        value: record,
+      });
+    },
+  );
+
+  it('keeps the sphere on an ordinary annual-goal edit and on closure', () => {
+    const goal = Object.freeze({ ...annualGoal, sphereTagKey });
+    const draft = { statement: 'Make releases easier to recover' };
+    const expected = { ...goal, ...draft };
+    const edited = updateAnnualGoal(goal, draft);
+    expect(edited).toStrictEqual({ ok: true, value: expected });
+    assert(edited.ok);
+    const { outcome, closureReason: reason } = closure;
+    expect(closeGoalRecord(edited.value, { outcome, reason })).toStrictEqual({
+      ok: true,
+      value: { ...expected, ...closure, status: 'closed' },
+    });
+  });
+
+  it('keeps the sphere on an ordinary Objective edit, reparent and closure', () => {
+    const goal = Object.freeze({ ...objective, sphereTagKey });
+    const draft = {
+      statement: 'Measure consistent release times',
+      quarter: '2027-Q2',
+      annualGoalKey: unknownAnnualGoalKey,
+    };
+    const expected = { ...goal, ...draft };
+    const edited = updateObjective(goal, draft, { [draft.annualGoalKey]: annualGoal });
+    expect(edited).toStrictEqual({ ok: true, value: expected });
+    assert(edited.ok);
+    const { outcome, closureReason: reason } = closure;
+    expect(closeGoalRecord(edited.value, { outcome, reason })).toStrictEqual({
+      ok: true,
+      value: { ...expected, ...closure, status: 'closed' },
+    });
+  });
+});

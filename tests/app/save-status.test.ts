@@ -1,7 +1,7 @@
 import type { SaveState } from '@super-productivity/plugin-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSaveStatus } from '../../src/app/save-status';
-import { applyPlan, EMPTY_STATE, type Plan } from '../../src/core/plan';
+import { applyPlan, EMPTY_STATE, MODEL_VERSION, type Plan } from '../../src/core/plan';
 import { canonicalJson } from '../../src/core/records';
 import { createHostFacade } from '../../src/platform/facade';
 import {
@@ -404,10 +404,10 @@ describe('Required save method or known schema is unavailable', () => {
     'keeps the goal readable with an incompatible %s',
     async (cause) => {
       const f = await editorFixture();
+      const v = MODEL_VERSION + 1;
       if (cause === 'method')
         vi.stubGlobal('PluginAPI', { ...f.host.api, getSyncedDataSaveState: undefined });
-      else
-        f.host.receiveSync(extra.key, canonicalJson({ v: 2, ver: versionOf(extra), at: savedAt }));
+      else f.host.receiveSync(extra.key, canonicalJson({ v, ver: versionOf(extra), at: savedAt }));
       await f.form.open(a.key);
       expect(f.form.view().intent.fields.statement).toBe('Цель 11');
       expect(f.form.view().message).toMatch(/Только чтение.*Обновите/);
