@@ -398,6 +398,10 @@ jobs:
                 ],
                 "initiative-task-backup.spec.ts": [
                   "Import a full synthetic backup in an isolated profile"
+                ],
+                "kr-values.spec.ts": [
+                  "Record measurements and read them on two devices",
+                  "Keep a visible measurement unconfirmed when its receipt is unavailable"
                 ]
               }
               | to_entries | map(.key as $file | .value[] | [$file, [.]]) | sort;
