@@ -159,7 +159,16 @@ type ApplyLog = Awaited<ReturnType<typeof observeApply>>;
 async function submitMeasurement(profile: StandProfile, log: ApplyLog, kr: Write, value: string) {
   const count = (await log.jsonValue()).requests.length;
   await expect(input(profile)).toHaveValue(value);
-  await button(profile.frame, 'Внести').click();
+  const submit = button(profile.frame, 'Внести');
+  const dismiss = profile.page.locator('mat-snack-bar-container button.close:visible');
+  await expect(async () => {
+    await submit.click({ trial: true, timeout: 1_000 }).catch(async (blocked: unknown) => {
+      if (await dismiss.isVisible()) await dismiss.click({ timeout: 1_000 });
+      // Retry actionability after the host snackbar dismisses or expires.
+      throw blocked;
+    });
+  }, '«Внести» is reachable past the host Angular Material snackbar').toPass({ timeout: 10_000 });
+  await submit.click({ timeout: 10_000 });
   await expect.poll(async () => (await log.jsonValue()).requests.length).toBe(count + 1);
   const { command } = (await log.jsonValue()).requests[count]!;
   expect(command).toMatchObject({
@@ -308,6 +317,7 @@ test('Keep a visible measurement unconfirmed when its receipt is unavailable', a
     await test.step('Commit the fact offline and close its card with both local drafts retained', async () => {
       try {
         await input(a).fill(observation);
+        await expect.poll(async () => (await status(form(a), [])).sync).toBe('offline');
         const submission = await submitMeasurement(a, log, kr, observation);
         expect((await status(form(a), [submission.write.key])).sync).toBe('offline');
         await backToList(a);
