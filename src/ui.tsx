@@ -1,8 +1,10 @@
 // Entry of ui.js (iframe).
+import type { PluginHooks } from '@super-productivity/plugin-api';
 import { render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { goalRecords, recordAt } from './app/commands';
 import { createGoalEditor, type GoalEditor } from './app/goal-editor';
+import { resolveLinkedReferences, type LinkedReferences } from './app/initiative-task-links';
 import { WIPE_KEY } from './core/records';
 import { createDraftStore } from './platform/draft-store';
 import {
@@ -15,35 +17,56 @@ import {
 import { send } from './platform/iframe-messaging';
 import { App } from './ui/App';
 
+type RefreshHook = PluginHooks.DATA_CHANGED | PluginHooks.PERSISTED_DATA_CHANGED;
+
+const refreshHooks = ['dataChanged', 'persistedDataChanged'] satisfies `${RefreshHook}`[];
+
+function isRefreshHook(hook: string): hook is RefreshHook {
+  return refreshHooks.some((name) => name === hook);
+}
+
+interface ViewActions {
+  readonly load: () => void;
+  readonly openSource: (source: string) => void;
+  readonly discard: (key: string) => void;
+}
+
 function View() {
-  const [snapshot, setSnapshot] = useState<ReadSnapshot>();
+  const [data, setData] = useState<{
+    snapshot: ReadSnapshot;
+    links: LinkedReferences;
+    draftKeys: readonly string[];
+  }>();
   const [message, setMessage] = useState('Загрузка…');
-  const [draftKeys, setDraftKeys] = useState<readonly string[]>([]);
   const [model, setModel] = useState<{
     editor: GoalEditor;
     view: ReturnType<GoalEditor['view']>;
   }>();
-  const [refresh, setRefresh] = useState<() => Promise<void>>(() => () => Promise.resolve());
+  const [actions, setActions] = useState<ViewActions>();
 
   useEffect(() => {
     let active = true;
-    const isActive = () => active;
+    let readNumber = 0;
+    let selection = 0;
+    let displayed = 0;
+    const stamps = new WeakMap<ReadSnapshot, number>();
     const drafts = createDraftStore();
-    const showSnapshot = (result: ReadSnapshot) => {
-      if (active) setSnapshot(result);
-    };
     const host = createHostFacade();
-    const compatibility = send({ cmd: 'compatibility' }).then(
-      (reason) => (typeof reason === 'string' ? reason : undefined),
-      () => 'Только чтение. Не удалось проверить совместимость основы.',
-    );
     const facade: EditorFacade = {
       ...host,
       apply: (plan, onIncomplete) =>
         send({ cmd: 'apply', plan }, onIncomplete ? { onIncomplete } : undefined),
       async read(keys?: readonly string[]) {
+        const stamp = ++readNumber;
+        const compatibility = send({ cmd: 'compatibility' }).then(
+          (reason) => (typeof reason === 'string' ? reason : undefined),
+          () => 'Только чтение. Не удалось проверить совместимость основы.',
+        );
         const [result, reason] = await Promise.all([host.read(keys), compatibility]);
-        return reason ? { ...result, readOnlyReason: result.readOnlyReason ?? reason } : result;
+        const snapshot =
+          reason && !result.readOnlyReason ? { ...result, readOnlyReason: reason } : result;
+        stamps.set(snapshot, stamp);
+        return snapshot;
       },
     };
 
@@ -52,30 +75,78 @@ function View() {
       drafts,
       now,
       newId,
-      onRead: showSnapshot,
+      readForStatus: host.read,
+      onRead(snapshot) {
+        void publish(snapshot);
+      },
       onChange() {
         if (active) setModel({ editor, view: editor.view() });
       },
     });
     setModel({ editor, view: editor.view() });
-    const load = async (initial = false) => {
+
+    async function publish(snapshot: ReadSnapshot, updateOpen = false) {
+      const stamp = stamps.get(snapshot) ?? 0;
+      const latest = () => active && stamp >= displayed;
+      const [references, listed] = await Promise.all([host.readBaseReferences(), drafts.list()]);
+      const links = await resolveLinkedReferences(snapshot, references, listed.keys, (key) =>
+        drafts.read(key),
+      );
+      if (!latest()) return;
+      displayed = stamp;
+      setData({
+        snapshot,
+        links,
+        draftKeys: listed.keys,
+      });
+      setMessage(listed.failed ? 'Не удалось прочитать список черновиков.' : '');
+      if (updateOpen) await editor.refresh(snapshot, latest);
+      return listed.keys;
+    }
+
+    async function load(initial = false) {
       try {
-        const [result, listed] = await Promise.all([facade.read(), drafts.list()]);
-        if (!active) return;
-        showSnapshot(result);
-        setDraftKeys(listed.keys);
-        setMessage(listed.failed ? 'Не удалось прочитать список черновиков.' : '');
-        const firstDraft = listed.keys[0];
+        const key = editor.view().key;
+        const result = await facade.read(key ? [key] : undefined);
+        const keys = await publish(result, true);
         const wipe = recordAt(result, WIPE_KEY)?.ver;
-        if (initial && firstDraft && wipe) {
+        if (initial && keys?.[0] && wipe) {
           const handled = await drafts.readWipeVersion().catch(() => undefined);
-          if (isActive() && !editor.view().key && wipe !== handled) await editor.open(firstDraft);
+          if (active && !editor.view().key && wipe !== handled) await editor.open(keys[0]);
         }
       } catch {
         if (active) setMessage('Не удалось прочитать данные.');
       }
-    };
-    setRefresh(() => load);
+    }
+
+    function refresh() {
+      if (active) void load();
+    }
+    for (const hook of refreshHooks) {
+      if (isRefreshHook(hook)) PluginAPI.registerHook(hook, refresh);
+    }
+    setActions({
+      load: refresh,
+      openSource(source) {
+        const requested = ++selection;
+        void host
+          .linkedRecordKey(source)
+          .then((key) => {
+            if (active && requested === selection) return editor.open(key, source);
+            return undefined;
+          })
+          .catch(() => {
+            if (active && requested === selection) setMessage('Не удалось определить ключ записи.');
+          });
+      },
+      discard(key) {
+        drafts.remove(key);
+        void drafts.flush().then((result) => {
+          if (result.ok) refresh();
+          else if (active) setMessage('Черновик не удалён.');
+        });
+      },
+    });
     void load(true);
     const draftWatch = setInterval(() => {
       void editor.checkDraft();
@@ -87,7 +158,7 @@ function View() {
     };
   }, []);
 
-  if (!model) return <p role="status">Загрузка…</p>;
+  if (!model || !actions || !data) return <p role="status">{message}</p>;
   const { editor, view } = model;
   const open = (key: string) => {
     void editor.open(key);
@@ -96,20 +167,21 @@ function View() {
     <App
       editor={editor}
       view={view}
-      records={snapshot ? goalRecords(snapshot) : {}}
-      draftKeys={draftKeys}
-      readOnly={snapshot?.readOnlyReason}
+      records={goalRecords(data.snapshot)}
+      links={data.links}
+      draftKeys={data.draftKeys}
+      readOnly={data.snapshot.readOnlyReason}
       message={message}
       open={open}
+      refresh={actions.load}
+      openSource={actions.openSource}
+      discard={actions.discard}
       create={(kind) => {
         open(`${kind}:${newId()}`);
       }}
       back={(choice) => {
         void editor.leave(choice).then((left) => {
-          if (left) {
-            return refresh();
-          }
-          return undefined;
+          if (left) actions.load();
         });
       }}
     />

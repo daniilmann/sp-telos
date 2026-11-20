@@ -19,12 +19,13 @@ import {
   isObject,
   isUuid,
   splitRecord,
-  WIPE_KEY,
+  type RecordInput,
   type StoredGoalRecord,
   type StoredRecord,
 } from '../core/records';
 import type { Draft, DraftStore } from '../platform/draft-store';
 import type { SaveStatus } from './save-status';
+import { sourceField, stringField } from './linked-editor-intent';
 
 export const EDIT_INTERVAL_MS = 2000;
 
@@ -62,10 +63,9 @@ export function isCompatibilityQuery(message: unknown): message is Compatibility
   return isObject(message) && Object.keys(message).length === 1 && message.cmd === 'compatibility';
 }
 
-export type GoalFields = Readonly<Record<string, string>>;
 export interface GoalIntent {
   readonly action: 'create' | 'edit' | 'close' | 'revise';
-  readonly fields: GoalFields;
+  readonly fields: Readonly<Record<string, unknown>>;
 }
 
 function isEditorRecord(record: StoredRecord): record is StoredGoalRecord {
@@ -86,16 +86,36 @@ export function recordAt(state: PlanState, key: string): StoredGoalRecord | unde
   return decoded.ok && isEditorRecord(decoded.value) ? decoded.value : undefined;
 }
 
+export function editorRecordAt(state: PlanState, key: string): StoredRecord | undefined;
+export function editorRecordAt<Kind extends 'initiative' | 'task-meta'>(
+  state: PlanState,
+  key: string,
+  kind: Kind,
+): Extract<StoredRecord, { kind: Kind }> | undefined;
+export function editorRecordAt(state: PlanState, key: string, kind?: 'initiative' | 'task-meta') {
+  const decoded = decodeRecord(key, state.entries[key] ?? '');
+  if (!decoded.ok) return undefined;
+  const record = decoded.value;
+  return kind === undefined || ('kind' in record && record.kind === kind) ? record : undefined;
+}
+
+export function isGoalAction(action: unknown): action is GoalIntent['action'] {
+  return action === 'create' || action === 'edit' || action === 'close' || action === 'revise';
+}
+
 export function draftIntent(draft: Draft): GoalIntent | undefined {
   const { action, ...fields } = draft.fields;
-  if (action !== 'create' && action !== 'edit' && action !== 'close' && action !== 'revise')
-    return undefined;
+  if (!isGoalAction(action)) return undefined;
   const strings: Record<string, string> = {};
   for (const [key, value] of Object.entries(fields)) {
+    if (key === 'sphereTagKey' && value === null) continue;
     if (typeof value !== 'string') return undefined;
     strings[key] = value;
   }
-  return { action, fields: strings };
+  return {
+    action,
+    fields: { ...strings, ...(fields.sphereTagKey === null && { sphereTagKey: null }) },
+  };
 }
 
 export function recordIntent(record?: StoredGoalRecord | GoalRecord): GoalIntent {
@@ -123,13 +143,23 @@ export function transition(
   const record = current && 'kind' in current ? splitRecord(current).record : undefined;
   if (action === 'close') {
     if (record?.status !== 'active') return undefined;
-    return closeGoalRecord(record, { outcome: fields.outcome ?? '', reason: fields.reason ?? '' });
+    return closeGoalRecord(record, {
+      outcome: stringField(fields, 'outcome') ?? '',
+      reason: stringField(fields, 'reason') ?? '',
+    });
   }
-  const { statement = '', quarter = '', annualGoalKey = '', objectiveKey = '' } = fields;
-  const { baseline = '', dataSource = '', target = '', revisionReason = '' } = fields;
-  const kr = { statement, baseline, dataSource, target, objectiveKey };
+  const values = action === 'edit' ? { ...recordIntent(record).fields, ...fields } : fields;
+  const get = (name: string) => stringField(values, name) ?? '';
+  const statement = get('statement');
+  const kr = {
+    statement,
+    baseline: get('baseline'),
+    dataSource: get('dataSource'),
+    target: get('target'),
+    objectiveKey: get('objectiveKey'),
+  };
   if (action === 'revise') {
-    return record?.kind === 'kr' ? reviseKr(record, kr, revisionReason) : undefined;
+    return record?.kind === 'kr' ? reviseKr(record, kr, get('revisionReason')) : undefined;
   }
   if (action === 'create' ? current !== undefined : !record) return undefined;
   if (kind === 'annual-goal') {
@@ -144,7 +174,7 @@ export function transition(
         parent.kind === 'annual-goal' ? [[key, parent] as const] : [],
       ),
     );
-    const objective = { statement, quarter, annualGoalKey };
+    const objective = { statement, quarter: get('quarter'), annualGoalKey: get('annualGoalKey') };
     return record?.kind === kind
       ? updateObjective(record, objective, annualGoals)
       : createObjective(objective, annualGoals);
@@ -164,7 +194,7 @@ export const absent = 'absent';
 export type DraftChoice = 'keep-draft' | 'use-saved' | 'discard-draft' | 'restore-as-new';
 
 export function draftChoices(
-  record: StoredGoalRecord | undefined,
+  record: StoredRecord | undefined,
   baseVer: string,
 ): DraftChoice[] | undefined {
   if ('deleted' in (record ?? {}) || (!record && baseVer !== absent))
@@ -173,7 +203,7 @@ export function draftChoices(
   return undefined;
 }
 
-interface PlanPreparation {
+export interface PlanPreparation {
   readonly state: PlanState;
   readonly key: string;
   readonly baseVer: string;
@@ -184,22 +214,35 @@ interface PlanPreparation {
   readonly newId: () => string;
 }
 
+export type EditorError =
+  | GoalError
+  | {
+      readonly field: string;
+      readonly code: 'required' | 'invalid' | 'unavailable';
+    };
+
 type Prepared =
   | { readonly plan: Plan; readonly write: Plan['writes'][number] }
-  | { readonly choices: DraftChoice[]; readonly record: StoredGoalRecord | undefined }
-  | { readonly message: string; readonly errors: readonly GoalError[] };
+  | { readonly choices: DraftChoice[]; readonly record: StoredRecord | undefined }
+  | { readonly message: string; readonly errors: readonly EditorError[] };
 
-export function prepareGoalPlan({
-  state,
-  key,
-  baseVer,
-  intent,
-  previousValue,
-  handoffVer,
-  at,
-  newId,
-}: PlanPreparation): Prepared {
-  const record = recordAt(state, key);
+export function prepareGoalPlan(options: PlanPreparation): Prepared {
+  const { key, state } = options;
+  return prepareEditorPlan(options, (intent) =>
+    transition(key.split(':')[0], recordAt(state, key), intent, state),
+  );
+}
+
+export function prepareEditorPlan(
+  { state, key, baseVer, intent, previousValue, handoffVer, at, newId }: PlanPreparation,
+  applyIntent: (
+    intent: GoalIntent,
+  ) =>
+    | { readonly ok: true; readonly value: RecordInput }
+    | { readonly ok: false; readonly errors: readonly EditorError[] }
+    | undefined,
+): Prepared {
+  const record = editorRecordAt(state, key);
   const materialized =
     record &&
     'kind' in record &&
@@ -210,7 +253,7 @@ export function prepareGoalPlan({
     intent.action === 'create' && record ? ({ ...intent, action: 'edit' } as const) : intent;
   const next = materialized
     ? ({ ok: true, value: splitRecord(record).record } as const)
-    : transition(key.split(':')[0], record, effective, state);
+    : applyIntent(effective);
   if (!next?.ok)
     return { errors: next?.errors ?? [], message: 'Проверьте данные и действие формы.' };
   const origin = intent.action === 'revise' && !materialized ? 'kr-revision' : 'manual';
@@ -231,14 +274,17 @@ export interface EditorView {
   readonly key: string;
   readonly baseVer: string;
   readonly intent: GoalIntent;
-  readonly record?: StoredGoalRecord | undefined;
-  readonly errors: readonly GoalError[];
+  readonly record?: StoredRecord | undefined;
+  readonly source?: string | undefined;
+  readonly readOnlyReason?: string | undefined;
+  readonly errors: readonly EditorError[];
   readonly message?: string | undefined;
   readonly draftMessage?: string | undefined;
   readonly deadline?: string | undefined;
   readonly readOnly?: boolean;
   readonly ready?: boolean;
   readonly busy?: boolean;
+  readonly awaitingRetry?: boolean;
   readonly status?: SaveStatus['state'] | undefined;
   readonly draftChoices?: readonly DraftChoice[] | undefined;
   readonly leaveChoices?: readonly LeaveChoice[] | undefined;
@@ -251,53 +297,13 @@ export interface GoalDraft extends Draft {
   readonly handoffVer?: string | undefined;
 }
 
-interface DraftContext {
-  readonly intent: GoalIntent | undefined;
-  readonly baseVer: string;
-  readonly draftChoices: DraftChoice[] | undefined;
-  readonly draftMessage: string | undefined;
-  readonly wipe: EditorView['wipe'];
-  readonly handoffVer: string | undefined;
-}
-
-async function readDraftContext(
-  drafts: DraftStore,
-  state: PlanState,
-  key: string,
-): Promise<DraftContext> {
-  const [local, listed, handled] = await Promise.all([
-    drafts.read(key),
-    drafts.list(),
-    drafts.readWipeVersion().catch(() => undefined),
-  ]);
-  const record = recordAt(state, key);
-  const restored = local.value && {
-    intent: draftIntent(local.value),
-    baseVer: local.value.baseVer,
-  };
-  const intent = restored?.intent;
-  const baseVer = restored?.intent ? restored.baseVer : (record?.ver ?? absent);
-  const wipeVer = recordAt(state, WIPE_KEY)?.ver;
-  const handoff = local.value && 'handoffVer' in local.value ? local.value.handoffVer : undefined;
-  return {
-    intent,
-    baseVer,
-    handoffVer: handoff === baseVer ? baseVer : undefined,
-    draftChoices: intent ? draftChoices(record, baseVer) : undefined,
-    draftMessage: local.failed || listed.failed ? 'Не удалось прочитать черновики' : undefined,
-    wipe:
-      wipeVer && wipeVer !== handled && listed.keys.length
-        ? { ver: wipeVer, count: listed.keys.length }
-        : undefined,
-  };
-}
-
 export interface GoalEditorDependencies {
   readonly facade: EditorFacade;
   readonly drafts: DraftStore;
   readonly now: () => number;
   readonly newId: () => string;
   readonly onChange?: () => void;
+  readonly readForStatus?: EditorFacade['read'];
   readonly onRead?: (snapshot: ReadSnapshot) => void;
 }
 
@@ -311,26 +317,11 @@ export const changed = 'Изменено';
 export const updatedInput = {
   errors: [],
   status: 'changed',
+  awaitingRetry: false,
   message: changed,
   leaveChoices: undefined,
   deadline: undefined,
 } as const;
-
-export async function readEditor(facade: EditorFacade, drafts: DraftStore, key: string) {
-  const snapshot = await facade.read([key, WIPE_KEY]);
-  const { intent, handoffVer, ...local } = await readDraftContext(drafts, snapshot, key);
-  const record = recordAt(snapshot, key);
-  const view: Partial<EditorView> = {
-    ...local,
-    record,
-    ready: true,
-    readOnly: Boolean(snapshot.readOnlyReason),
-    intent: intent ?? recordIntent(record),
-    status: intent ? 'changed' : undefined,
-    message: snapshot.readOnlyReason ?? (intent ? changed : undefined),
-  };
-  return { snapshot, view, handoffVer, dirty: intent !== undefined };
-}
 
 export function afterWipe(
   view: EditorView,
@@ -345,25 +336,20 @@ export function afterWipe(
   if (!handled || !discard) return status;
   return {
     ...status,
-    ...afterDraftDiscard(view.record),
+    ...afterDraftDiscard(view.record, view.source),
   };
 }
 
-export function afterDraftDiscard(record?: StoredGoalRecord): Partial<EditorView> {
+export function afterDraftDiscard(record?: StoredRecord, source?: string): Partial<EditorView> {
   return {
-    intent: recordIntent(record),
+    record,
+    intent: editorIntent(record, source),
     baseVer: record?.ver ?? absent,
     draftChoices: undefined,
+    awaitingRetry: false,
     status: undefined,
     message: undefined,
   };
-}
-
-export function applyHandoffToSnapshot(
-  snapshot: ReadSnapshot,
-  { key, value }: Submission['write'],
-) {
-  return { ...snapshot, entries: { ...snapshot.entries, [key]: value } };
 }
 
 export const leaveFailed = {
@@ -378,3 +364,18 @@ export const removalMessages = {
   'write-failed': draftError,
   'remove-failed': failedRemoval,
 };
+
+function editorIntent(record?: StoredRecord, source?: string): GoalIntent {
+  if (record && 'kind' in record) {
+    if (record.kind === 'initiative' || record.kind === 'task-meta') {
+      const field = sourceField(record.kind);
+      return {
+        action: 'edit',
+        fields: { [field]: record.kind === 'initiative' ? record.projectKey : record.taskKey },
+      };
+    }
+    return recordIntent(record);
+  }
+  const kind = source?.startsWith('project:') ? 'initiative' : 'task-meta';
+  return { action: 'create', fields: source === undefined ? {} : { [sourceField(kind)]: source } };
+}

@@ -7,20 +7,13 @@ import {
 } from '../platform/facade';
 import {
   absent,
-  changed,
   EDIT_INTERVAL_MS,
   updatedInput,
   draftError,
-  failedRemoval,
   removalMessages,
   leaveFailed,
   afterWipe,
-  afterDraftDiscard,
-  applyHandoffToSnapshot,
-  draftChoices,
-  readEditor,
-  prepareGoalPlan,
-  recordAt,
+  editorRecordAt,
   recordIntent,
   type DraftChoice,
   type EditorView,
@@ -30,6 +23,9 @@ import {
   type GoalEditorDependencies,
   type Submission,
 } from './commands';
+import { resolveEditorDraft, prepareFormPlan, refreshedView } from './initiative-task-links';
+import { linkedKind, pendingWipe, readEditor } from './linked-editor-intent';
+import { WIPE_KEY } from '../core/records';
 import { createSaveStatus, saveMessage } from './save-status';
 
 export function createGoalEditor({
@@ -39,6 +35,7 @@ export function createGoalEditor({
   newId,
   onChange,
   onRead,
+  readForStatus,
 }: GoalEditorDependencies) {
   const initial: EditorView = { key: '', baseVer: absent, intent: recordIntent(), errors: [] };
   let view = initial;
@@ -53,8 +50,9 @@ export function createGoalEditor({
     | undefined;
   const lastHandoffByKey = new Map<string, number>();
   let dirty = false;
+  let navigation = 0;
   const status = createSaveStatus({
-    read: (keys) => facade.read(keys),
+    read: readForStatus ?? ((keys) => facade.read(keys)),
     readSaveState: (keys) => facade.readSaveState(keys),
     now,
     onStatus(next) {
@@ -141,13 +139,24 @@ export function createGoalEditor({
     onChange?.();
   }
 
-  async function open(key: string): Promise<void> {
+  async function open(key: string, source?: string): Promise<void> {
+    const turn = ++navigation;
+    if (view.key) {
+      const oldForm = formId;
+      const oldGeneration = generation;
+      const result = await drafts.flush();
+      if (turn !== navigation || formId !== oldForm || generation !== oldGeneration) return;
+      if (!result.ok) {
+        update(leaveFailed);
+        return;
+      }
+    }
     close();
     const id = newId();
     formId = id;
     update({ key, message: 'Загрузка…' });
     try {
-      const opened = await readEditor(facade, drafts, key);
+      const opened = await readEditor(facade, drafts, key, source);
       if (formId !== id) return;
       dirty = opened.dirty;
       handoffVer = opened.handoffVer;
@@ -178,7 +187,8 @@ export function createGoalEditor({
   }
 
   function scheduleSave(): void {
-    if (scheduledSave || view.busy || view.draftChoices || view.wipe || !editingText()) return;
+    const blocked = view.busy || view.draftChoices || view.wipe;
+    if (scheduledSave || blocked || linkedKind(view.key) || !editingText()) return;
     void delaySave(remainingDelay() || EDIT_INTERVAL_MS);
   }
 
@@ -210,7 +220,7 @@ export function createGoalEditor({
       view.wipe
     )
       return;
-    if (!retry && submission?.generation === generation) return;
+    if (!retry && (view.awaitingRetry || submission?.generation === generation)) return;
     cancelScheduledSave();
     const delay = !retry && editingText() ? remainingDelay() : 0;
     return delay > 0 ? delaySave(delay) : submit(retry);
@@ -226,18 +236,31 @@ export function createGoalEditor({
     confirmation = undefined;
     update({ busy: true, errors: [], deadline: undefined });
     try {
-      const snapshot = await facade.read([key]);
+      const linking = linkedKind(key) || intent.fields.sphereTagKey !== undefined;
+      const [snapshot, references] = await Promise.all([
+        facade.read([key, WIPE_KEY]),
+        linking ? facade.readBaseReferences?.() : undefined,
+      ]);
+      const wipe = await pendingWipe(drafts, snapshot);
       if (!currentForm()) return;
       onRead?.(snapshot);
       if (snapshot.readOnlyReason) {
-        update({ readOnly: true, message: snapshot.readOnlyReason });
+        update({
+          readOnly: true,
+          readOnlyReason: snapshot.readOnlyReason,
+          message: snapshot.readOnlyReason,
+        });
+        return;
+      }
+      if (wipe) {
+        update({ wipe });
         return;
       }
       const previousValue =
         previous?.generation === epoch && previous.write.key === key
           ? previous.write.value
           : undefined;
-      const prepared = prepareGoalPlan({
+      const options = {
         state: snapshot,
         key,
         baseVer,
@@ -246,7 +269,8 @@ export function createGoalEditor({
         handoffVer,
         at: now(),
         newId,
-      });
+      };
+      const prepared = prepareFormPlan(options, references);
       if ('choices' in prepared) {
         update({
           record: prepared.record,
@@ -263,7 +287,7 @@ export function createGoalEditor({
       const { plan, write } = prepared;
       const sent = { write, generation: epoch };
       submission = sent;
-      update({ status: 'pending', message: 'Сохраняется…' });
+      update({ status: 'pending', awaitingRetry: false, message: 'Сохраняется…' });
       const result = await handoffGoalPlan(
         facade,
         plan,
@@ -275,7 +299,7 @@ export function createGoalEditor({
       );
       if (result.applied) lastHandoffByKey.set(key, now());
       if (formId !== id) return;
-      if (result.applied) acceptHandoff(write, baseVer, snapshot, currentForm());
+      if (result.applied) acceptHandoff(write, baseVer, currentForm());
       if (!currentForm()) return;
       await status.track({ formId: id, generation: epoch, planId: newId() }, plan);
       if (!currentForm()) return;
@@ -290,75 +314,41 @@ export function createGoalEditor({
     }
   }
 
-  function acceptHandoff(
-    write: Submission['write'],
-    baseVer: string,
-    snapshot: ReadSnapshot,
-    sameIntent: boolean,
-  ): void {
+  function acceptHandoff(write: Submission['write'], baseVer: string, sameIntent: boolean): void {
     if (view.key !== write.key || view.baseVer !== baseVer) return;
-    const state = applyHandoffToSnapshot(snapshot, write);
-    const record = recordAt(state, write.key);
+    const record = editorRecordAt({ entries: { [write.key]: write.value } }, write.key);
     if (!record) return;
     if (sameIntent) handoffVer = record.ver;
     update({ baseVer: record.ver, record });
     storeDraft();
-    onRead?.(state);
   }
 
-  async function resolveDraft(choice: DraftChoice): Promise<void> {
+  async function resolveDraft(choice: DraftChoice, target?: string): Promise<void> {
     if (!view.draftChoices?.includes(choice) || view.wipe || view.busy) return;
-    const { key, record, intent } = view;
     const id = formId;
+    const current = () => formId === id;
     invalidate();
     update({ busy: true });
     try {
-      const snapshot = await facade.read([key]);
-      if (formId !== id) return;
-      const remote = recordAt(snapshot, key);
-      if (remote?.ver !== record?.ver) {
-        update({ record: remote, draftChoices: draftChoices(remote, view.baseVer) });
-        return;
-      }
-      if (choice === 'keep-draft') {
-        update({
-          baseVer: remote?.ver ?? absent,
-          draftChoices: undefined,
-          status: 'changed',
-          message: changed,
-        });
-        storeDraft();
-        return;
-      }
-      if (choice === 'restore-as-new') {
-        const newKey = `${key.split(':')[0] ?? ''}:${newId()}`;
-        update({
-          key: newKey,
-          baseVer: absent,
-          intent: { ...intent, action: 'create' },
-          record: undefined,
-          draftChoices: undefined,
-          status: 'changed',
-          message: changed,
-        });
-        storeDraft();
-        if (!(await drafts.flush()).ok) {
-          if (formId === id) update({ draftMessage: draftError });
-          return;
-        }
-        if (formId !== id) return;
-      }
-      drafts.remove(key);
-      if (choice !== 'restore-as-new') {
-        dirty = false;
-        update(afterDraftDiscard(remote));
-      }
-      const result = await drafts.flush();
-      if (formId === id) update({ draftMessage: result.ok ? undefined : failedRemoval });
+      await resolveEditorDraft({
+        facade,
+        drafts,
+        view,
+        choice,
+        target,
+        now,
+        newId,
+        current,
+        update,
+        storeDraft,
+        markClean: () => {
+          dirty = false;
+        },
+      });
     } catch {
-      if (formId === id) update({ message: 'Не удалось прочитать данные.' });
+      if (current()) update({ message: 'Не удалось прочитать данные.' });
     } finally {
-      if (formId === id) update({ busy: false });
+      if (current()) update({ busy: false });
     }
   }
 
@@ -399,6 +389,13 @@ export function createGoalEditor({
   return {
     open,
     checkDraft,
+    async refresh(snapshot: ReadSnapshot, latest: () => boolean) {
+      const id = formId;
+      const wipe = await pendingWipe(drafts, snapshot);
+      if (!latest() || !id || formId !== id) return;
+      if (wipe) cancelScheduledSave();
+      update(refreshedView(view, snapshot, snapshot.readOnlyReason, wipe, dirty));
+    },
     close,
     input,
     save,

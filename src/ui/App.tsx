@@ -1,12 +1,19 @@
-import type { GoalIntent } from '../app/commands';
+import { linkedKind } from '../app/linked-editor-intent';
 import type { GoalEditor } from '../app/goal-editor';
 import type { GoalRecord } from '../core/goals';
+import type { LinkedReferences } from '../app/initiative-task-links';
+import { LinkForm, LinkLists } from './links/LinkForms';
+import { ReferenceChoices, type ReferenceOptions } from './links/ReferencePicker';
 import { GoalForm, kindLabels, type FormProps, type GoalRecords } from './goals/GoalForm';
 
 interface AppProps {
   readonly editor: GoalEditor;
   readonly view: ReturnType<GoalEditor['view']>;
   readonly records: GoalRecords;
+  readonly links: LinkedReferences;
+  readonly refresh: () => void;
+  readonly openSource: (source: string) => void;
+  readonly discard: (key: string) => void;
   readonly draftKeys: readonly string[];
   readonly readOnly: string | undefined;
   readonly message: string;
@@ -19,6 +26,10 @@ export function App({
   editor,
   view,
   records,
+  links,
+  refresh,
+  openSource,
+  discard,
   draftKeys,
   readOnly,
   message,
@@ -26,30 +37,44 @@ export function App({
   create,
   back,
 }: Readonly<AppProps>) {
+  const kind = linkedKind(view.key);
+  const restoreOptions = kind === 'initiative' ? links.projects : links.tasks;
   const draftActions = {
     view,
     back,
     retryDraft: () => void editor.retryDraftRemoval(),
-    resolveDraft: (choice: Parameters<GoalEditor['resolveDraft']>[0]) =>
-      void editor.resolveDraft(choice),
+    resolveDraft: (choice: Parameters<GoalEditor['resolveDraft']>[0], target?: string) =>
+      void editor.resolveDraft(choice, target),
     resolveWipe: (choice: Parameters<GoalEditor['resolveWipe']>[0]) =>
       void editor.resolveWipe(choice),
   };
+  const form = {
+    view,
+    input: editor.input,
+    save: () => void editor.save(),
+    retry: () => void editor.retry(),
+    back,
+    draftActions: (
+      <DraftActions {...draftActions} moveOptions={kind ? restoreOptions : undefined} />
+    ),
+  };
+  const openForm = kind ? (
+    <LinkForm {...form} links={links} />
+  ) : (
+    <GoalForm {...form} records={records} spheres={links.tags} />
+  );
   return (
     <main class="page stack" lang="ru">
-      <h1>Цели и результаты</h1>
+      <header class="page-header">
+        <h1>Цели и результаты</h1>
+        <button type="button" class="btn-text" onClick={refresh}>
+          Обновить
+        </button>
+      </header>
       {message && <p role="status">{message}</p>}
       {readOnly && readOnly !== view.message && <p class="callout callout--warning">{readOnly}</p>}
       {view.key ? (
-        <GoalForm
-          view={view}
-          records={records}
-          input={(intent: GoalIntent) => editor.input(intent)}
-          save={() => void editor.save()}
-          retry={() => void editor.retry()}
-          back={back}
-          draftActions={<DraftActions {...draftActions} />}
-        />
+        openForm
       ) : (
         <div class="stack">
           {Object.entries(kindLabels).map(([kind, label]) => {
@@ -106,6 +131,7 @@ export function App({
               </section>
             );
           })}
+          <LinkLists {...{ links, open, openSource, discard }} />
         </div>
       )}
     </main>
@@ -135,11 +161,16 @@ function DraftActions({
   retryDraft,
   resolveWipe,
   resolveDraft,
+  moveOptions,
   back,
 }: Readonly<Pick<FormProps, 'view' | 'back'>> & {
   readonly retryDraft: () => void;
   readonly resolveWipe: (choice: Parameters<GoalEditor['resolveWipe']>[0]) => void;
-  readonly resolveDraft: (choice: Parameters<GoalEditor['resolveDraft']>[0]) => void;
+  readonly resolveDraft: (
+    choice: Parameters<GoalEditor['resolveDraft']>[0],
+    target?: string,
+  ) => void;
+  readonly moveOptions: ReferenceOptions | undefined;
 }) {
   const { wipe, draftChoices, leaveChoices, draftMessage, busy } = view;
   return (
@@ -203,19 +234,42 @@ function DraftActions({
               : 'Сохранённая версия изменилась после создания черновика.'}
           </p>
           <div class="row">
-            {draftChoices.map((choice) => (
-              <button
-                type="button"
-                key={choice}
-                disabled={busy}
-                onClick={() => {
-                  resolveDraft(choice);
-                }}
-              >
-                {draftLabels[choice]}
-              </button>
-            ))}
+            {draftChoices
+              .filter((choice) => choice !== 'restore-as-new' || !moveOptions)
+              .map((choice) => (
+                <button
+                  type="button"
+                  key={choice}
+                  disabled={busy}
+                  onClick={() => {
+                    resolveDraft(choice);
+                  }}
+                >
+                  {draftLabels[choice]}
+                </button>
+              ))}
           </div>
+          {moveOptions && draftChoices.includes('restore-as-new') && (
+            <form
+              class="row"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const target = new FormData(event.currentTarget).get('target');
+                if (typeof target === 'string' && target) resolveDraft('restore-as-new', target);
+              }}
+            >
+              <label class="field">
+                <span>Другой объект</span>
+                <select name="target" required disabled={busy || view.readOnly}>
+                  <option value="">Выберите объект</option>
+                  <ReferenceChoices options={moveOptions} />
+                </select>
+              </label>
+              <button type="submit" disabled={busy || view.readOnly}>
+                {draftLabels['restore-as-new']}
+              </button>
+            </form>
+          )}
         </div>
       )}
     </>

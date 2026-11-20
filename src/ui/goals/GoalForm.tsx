@@ -3,6 +3,9 @@ import { recordIntent } from '../../app/commands';
 import type { GoalIntent } from '../../app/commands';
 import type { GoalEditor } from '../../app/goal-editor';
 import type { GoalError, GoalRecord } from '../../core/goals';
+import { stringField } from '../../app/linked-editor-intent';
+import { selection, SphereField } from '../../ui/links/LinkForms';
+import type { ReferenceOptions } from '../../ui/links/ReferencePicker';
 
 type View = ReturnType<GoalEditor['view']>;
 export type GoalRecords = Readonly<Record<string, GoalRecord | undefined>>;
@@ -10,6 +13,7 @@ export type GoalRecords = Readonly<Record<string, GoalRecord | undefined>>;
 export interface FormProps {
   readonly draftActions?: ComponentChildren;
   readonly view: View;
+  readonly spheres?: ReferenceOptions;
   readonly records: GoalRecords;
   readonly input: (intent: GoalIntent) => void;
   readonly save: () => void;
@@ -47,7 +51,8 @@ const errors = {
   required: 'Заполните это поле.',
   'unknown-parent': 'Родительская запись недоступна. Выберите существующую запись.',
   invalid: 'Выберите допустимое значение.',
-} satisfies Record<GoalError['code'], string>;
+  unavailable: 'Выбранная сфера недоступна.',
+} satisfies Record<View['errors'][number]['code'], string>;
 
 type Field = GoalError['field'];
 type Option = readonly [value: string, label: string];
@@ -80,6 +85,11 @@ function fieldOptions(
   );
 }
 
+function changedFields(view: View, kind: GoalRecord['kind']): GoalIntent['fields'] {
+  const clean = view.status === undefined || view.status === 'saved';
+  return kind !== 'kr' && view.intent.action === 'edit' && clean ? {} : view.intent.fields;
+}
+
 function GoalField({
   field,
   kind,
@@ -88,7 +98,12 @@ function GoalField({
   input,
 }: Pick<FormProps, 'view' | 'records' | 'input'> & { field: Field; kind: GoalRecord['kind'] }) {
   const { intent } = view;
-  const value = intent.fields[field] ?? '';
+  const value =
+    stringField(intent.fields, field) ??
+    (intent.action === 'edit'
+      ? stringField(recordIntent(goalRecord(view)).fields, field)
+      : undefined) ??
+    '';
   const options = fieldOptions(field, kind, records);
   const error = view.errors.find((item) => item.field === field);
   const id = `goal-${field}`;
@@ -100,7 +115,7 @@ function GoalField({
     value,
   };
   const change = (text: string) => {
-    input({ ...intent, fields: { ...intent.fields, [field]: text } });
+    input({ ...intent, fields: { ...changedFields(view, kind), [field]: text } });
   };
   return (
     <div class="field">
@@ -191,9 +206,16 @@ function RecordDetails({
   );
 }
 
+function goalRecord(view: View): GoalRecord | undefined {
+  const { record } = view;
+  return record && 'kind' in record && record.kind !== 'initiative' && record.kind !== 'task-meta'
+    ? record
+    : undefined;
+}
+
 export function GoalForm(props: Readonly<FormProps>) {
   const { view, records } = props;
-  const record = view.record && 'kind' in view.record ? view.record : undefined;
+  const record = goalRecord(view);
   const prefix = view.key.split(':')[0];
   const kind = record?.kind ?? (prefix === 'kr' || prefix === 'objective' ? prefix : 'annual-goal');
   return (
@@ -241,6 +263,8 @@ function GoalFieldsForm(props: Readonly<FieldsProps>) {
   const blocked = Boolean(view.readOnly || view.draftChoices || view.wipe);
   const retry = view.status === 'retry' || view.status === 'unknown' || view.status === 'replaced';
   const { legend, submit } = actionLabels[action];
+  const sphereError = view.errors.find(({ field }) => field === 'sphereTagKey');
+  const editableSphere = kind !== 'kr' && (action === 'create' || action === 'edit');
   function startRevision(current: GoalRecord): void {
     input({ action: 'revise', fields: action === 'edit' ? fields : recordIntent(current).fields });
   }
@@ -257,6 +281,20 @@ function GoalFieldsForm(props: Readonly<FieldsProps>) {
         {fieldsFor(kind, action).map((field) => (
           <GoalField key={field} {...{ field, kind, view, records, input }} />
         ))}
+        {editableSphere && props.spheres && (
+          <SphereField
+            options={props.spheres}
+            value={selection(
+              fields,
+              'sphereTagKey',
+              record?.kind === 'kr' ? undefined : record?.sphereTagKey,
+            )}
+            change={(sphereTagKey) => {
+              input({ action, fields: { ...changedFields(view, kind), sphereTagKey } });
+            }}
+          />
+        )}
+        {sphereError && <span class="field-error">{errors[sphereError.code]}</span>}
       </fieldset>
       {!blocked && (
         <div class="row">
