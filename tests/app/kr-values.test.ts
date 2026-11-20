@@ -119,12 +119,13 @@ async function fixture(extra: ReadSnapshot['entries'] = {}) {
     await update(await facade.read());
   }
   function sent() {
-    const [plan, options] = facade.apply.mock.lastCall!;
+    const [plan, observer] = facade.apply.mock.lastCall!;
+    const options: HandoffOptions | undefined = observer;
     expect(plan.writes).toHaveLength(1);
     const write = plan.writes[0]!;
     expect(write.base).toBe('absent');
     expect(plan.origin).toBe('manual');
-    return { ...write, plan, options, ver: versionOf(write) };
+    return { ...write, plan, options: options && { ...options }, ver: versionOf(write) };
   }
   const local = { disk, rows, mutation, finish, drafts: () => drafts };
   return { initial, host, facade, local, open, restart, refresh, sent };
