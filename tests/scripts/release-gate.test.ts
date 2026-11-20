@@ -189,6 +189,8 @@ const linkedBrowserScenarios = {
   'initiative-task-backup.spec.ts': ['Import a full synthetic backup in an isolated profile'],
 };
 
+const candidateScenarios = { ...browserScenarios, ...linkedBrowserScenarios };
+
 function completedBrowserReport(scenarios: Record<string, string[]> = browserScenarios) {
   return {
     suites: Object.entries(scenarios).map(([file, titles]) => ({
@@ -213,7 +215,7 @@ function completedBrowserReport(scenarios: Record<string, string[]> = browserSce
 
 function validateBrowserReport(
   report: ReturnType<typeof completedBrowserReport>,
-  stage: 'original' | 'candidate' = 'original',
+  stage: 'original' | 'candidate' | 'live' = 'original',
 ) {
   const browser = gate.jobs.browser!;
   checkRequiredStep(browser, stand);
@@ -228,14 +230,15 @@ function validateBrowserReport(
   expect(workflowValidator, 'The browser job must validate the reported results').not.toBe('');
   const requiredList = /def required_scenarios:\s*\{[^}]+\}/;
   expect(workflowValidator).toMatch(requiredList);
-  // Keep the original checks on their release's list while running the workflow's predicate.
+  // Replay each historical list with the same report predicate used by the live gate.
+  const releaseScenarios = stage === 'original' ? browserScenarios : candidateScenarios;
   const validator =
-    stage === 'original'
-      ? workflowValidator.replace(
+    stage === 'live'
+      ? workflowValidator
+      : workflowValidator.replace(
           requiredList,
-          `def required_scenarios: ${JSON.stringify(browserScenarios)}`,
-        )
-      : workflowValidator;
+          `def required_scenarios: ${JSON.stringify(releaseScenarios)}`,
+        );
 
   // Playwright can exit successfully with an incomplete selection. Exercise the shell
   // that consumes its JSON after that exit, without starting the browser stand.
@@ -306,8 +309,7 @@ it.each([
   expect(result.status, result.stderr).toBeGreaterThan(0);
 });
 
-const candidateReport = () =>
-  completedBrowserReport({ ...browserScenarios, ...linkedBrowserScenarios });
+const candidateReport = () => completedBrowserReport(candidateScenarios);
 
 it('accepts the candidate report with all nineteen required browser scenarios passed once', () => {
   const report = candidateReport();
@@ -317,37 +319,58 @@ it('accepts the candidate report with all nineteen required browser scenarios pa
   expect(result.status, result.stderr).toBe(0);
 });
 
-it.each(['missing', 'extra', 'duplicate', 'skipped', 'retried', 'failed'] as const)(
-  'rejects a candidate report with a %s scenario',
-  (change) => {
-    const report = candidateReport();
-    const specs = report.suites.find(({ file }) => file === 'initiative-task-links.spec.ts')!.specs;
-    const spec = specs[0]!;
-    const test = spec.tests[0]!;
-    switch (change) {
-      case 'missing':
-        specs.shift();
-        break;
-      case 'extra':
-        specs.push({ ...spec, title: 'Unlisted scenario' });
-        break;
-      case 'duplicate':
-        specs[1] = structuredClone(spec);
-        break;
-      case 'skipped':
-        test.expectedStatus = 'skipped';
-        break;
-      case 'retried':
-        test.results = [{ status: 'passed', retry: 1 }];
-        break;
-      case 'failed':
-        test.results = [{ status: 'failed' }];
-        break;
-    }
-    const result = validateBrowserReport(report, 'candidate');
-    expect(result.status, result.stderr).toBe(1);
-  },
-);
+const reportChanges = {
+  missing: (specs: BrowserSpecs) => specs.slice(1),
+  extra: (specs: BrowserSpecs) => [...specs, { ...specs[0]!, title: 'Unlisted scenario' }],
+  duplicate: (specs: BrowserSpecs) => [specs[0]!, structuredClone(specs[0]!), ...specs.slice(2)],
+  skipped: (specs: BrowserSpecs) => reviseFirstTest(specs, { expectedStatus: 'skipped' }),
+  retried: (specs: BrowserSpecs) =>
+    reviseFirstTest(specs, { results: [{ status: 'passed', retry: 1 }] }),
+  failed: (specs: BrowserSpecs) => reviseFirstTest(specs, { results: [{ status: 'failed' }] }),
+};
+
+type BrowserReport = ReturnType<typeof completedBrowserReport>;
+type BrowserSpecs = BrowserReport['suites'][number]['specs'];
+
+function reviseFirstTest(
+  specs: BrowserSpecs,
+  patch: Partial<BrowserSpecs[number]['tests'][number]>,
+) {
+  Object.assign(specs[0]!.tests[0]!, patch);
+  return specs;
+}
+
+const changes = Object.keys(reportChanges) as (keyof typeof reportChanges)[];
+function changeReport(report: BrowserReport, file: string, change: keyof typeof reportChanges) {
+  const suite = report.suites.find((entry) => entry.file === file)!;
+  suite.specs = reportChanges[change](suite.specs);
+  return report;
+}
+
+it.each(changes)('rejects a candidate report with a %s scenario', (change) => {
+  const report = changeReport(candidateReport(), 'initiative-task-links.spec.ts', change);
+  const result = validateBrowserReport(report, 'candidate');
+  expect(result.status, result.stderr).toBe(1);
+});
+
+it('requires all twenty-one browser scenarios to pass on their first attempt', () => {
+  const file = 'kr-values.spec.ts';
+  const report = completedBrowserReport({
+    ...candidateScenarios,
+    [file]: [
+      'Record measurements and read them on two devices',
+      'Keep a visible measurement unconfirmed when its receipt is unavailable',
+    ],
+  });
+  expect(report.suites.flatMap(({ specs }) => specs)).toHaveLength(21);
+  const result = validateBrowserReport(report, 'live');
+  expect(result.status, result.stderr).toBe(0);
+  for (const change of changes) {
+    const invalid = changeReport(structuredClone(report), file, change);
+    const result = validateBrowserReport(invalid, 'live');
+    expect(result.status, `${change}: ${result.stderr}`).toBe(1);
+  }
+});
 
 it('branch and manual runs cannot publish', () => {
   expect(canWriteContents(gate.permissions)).toBe(false);
