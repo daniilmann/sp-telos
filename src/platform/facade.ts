@@ -2,7 +2,17 @@ import { sameDraft, type Draft, type DraftStore } from './draft-store';
 import type { SaveState } from '@super-productivity/plugin-api';
 import type { Command } from '../app/commands';
 import type { Plan, PlanState } from '../core/plan';
-import { decodeRecord, isUuid, RECORD_PREFIXES, WIPE_KEY } from '../core/records';
+import {
+  decodeRecord,
+  isModelVersion,
+  isObject,
+  isUuid,
+  MODEL_VERSION,
+  RECORD_PREFIXES,
+  WIPE_KEY,
+} from '../core/records';
+import { readBaseReferences } from './base-references';
+import { linkedRecordKey, linkedRecordSource, matchesLinkedRecord } from './linked-record-keys';
 
 export interface Facade<ApplyResult = PlanState> {
   read(): Promise<PlanState>;
@@ -52,44 +62,120 @@ function isRecordKey(key: string): boolean {
   );
 }
 
-export async function readRecords(additionalKeys: readonly string[] = []): Promise<PlanState> {
-  const missing = missingReadMethods();
-  if (missing.includes('loadSyncedData')) return { entries: {} };
-  const collections = missing.includes('listSyncedDataKeys')
-    ? []
-    : await Promise.all(RECORD_PREFIXES.map((prefix) => PluginAPI.listSyncedDataKeys(prefix)));
-  // A pending local write may already be readable by key before it appears in a listing.
-  const keys = new Set([...collections.flat(), WIPE_KEY, ...additionalKeys.filter(isRecordKey)]);
-  const records = await Promise.all(
-    [...keys].map(async (key) => [key, await PluginAPI.loadSyncedData(key)] as const),
-  );
+const unknownVersion = 'Только чтение. Обновите плагин: обнаружена неизвестная версия схемы.';
+
+function invalidRecordReason(key: string, raw: string): string | undefined {
+  let record: unknown;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    // A damaged JSON value cannot establish its version.
+  }
+  if (!isObject(record) || !isModelVersion(record.v))
+    return `Только чтение. Не удалось проверить версию схемы записи ${key}.`;
+  const legacyKey = !key.startsWith('initiative:') && !key.startsWith('task-meta:');
+  if (record.v !== MODEL_VERSION && !(record.v === 1 && legacyKey)) return unknownVersion;
+  return key === WIPE_KEY ? 'Только чтение. Некорректная схема маркера meta:wipe.' : undefined;
+}
+
+type RecordRead =
+  | { readonly status: 'read'; readonly value: string; readonly source: string | undefined }
+  | { readonly status: 'absent' }
+  | { readonly status: 'unread'; readonly reason?: string | undefined };
+
+function inspectRecord(key: string, raw: string): RecordRead {
+  const decoded = decodeRecord(key, raw);
+  return decoded.ok
+    ? { status: 'read', value: raw, source: linkedRecordSource(decoded.value) }
+    : {
+        status: 'unread',
+        reason:
+          decoded.reason === 'unsupported-version' ? unknownVersion : invalidRecordReason(key, raw),
+      };
+}
+
+function snapshotFromReads(
+  reads: readonly (readonly [string, RecordRead])[],
+  readOnlyReason?: string,
+  previouslyUnread?: readonly string[],
+): ReadSnapshot {
+  const entries: [string, string][] = [];
+  const unread = new Set(previouslyUnread);
+  for (const [key, record] of reads) {
+    if (record.status === 'read') entries.push([key, record.value]);
+    if (record.status === 'unread') {
+      unread.add(key);
+      readOnlyReason ??= record.reason;
+    }
+  }
   return {
-    entries: Object.fromEntries(
-      records.filter((record): record is readonly [string, string] => record[1] !== null),
-    ),
+    entries: Object.fromEntries(entries),
+    ...(unread.size > 0 && { unreadKeys: [...unread] }),
+    ...(readOnlyReason && { readOnlyReason }),
   };
 }
 
-export function inspectRecords({ entries }: PlanState): ReadSnapshot {
-  const known: [string, string][] = [];
-  let readOnlyReason: string | undefined;
-  for (const [key, value] of Object.entries(entries)) {
-    const decoded = decodeRecord(key, value);
-    if (decoded.ok) known.push([key, value]);
-    else if (decoded.reason === 'unsupported-version') {
-      readOnlyReason = 'Только чтение. Обновите плагин: обнаружена неизвестная версия схемы.';
+// Structural inspection for callers with an in-memory snapshot.
+export function inspectRecords({ entries, unreadKeys }: PlanState): ReadSnapshot {
+  return snapshotFromReads(
+    Object.entries(entries).map(([key, raw]) => [key, inspectRecord(key, raw)]),
+    undefined,
+    unreadKeys,
+  );
+}
+
+async function readRecord(key: string, listed: boolean): Promise<RecordRead> {
+  const reason = `Только чтение. Не удалось прочитать запись ${key}.`;
+  let raw: string | null;
+  try {
+    raw = await PluginAPI.loadSyncedData(key);
+  } catch {
+    return { status: 'unread', reason };
+  }
+  if (raw === null) return listed ? { status: 'unread', reason } : { status: 'absent' };
+
+  const record = inspectRecord(key, raw);
+  if (
+    record.status === 'read' &&
+    record.source !== undefined &&
+    !(await matchesLinkedRecord(key, record.source))
+  ) {
+    return { status: 'unread' };
+  }
+  return record;
+}
+
+export async function readRecords(additionalKeys: readonly string[] = []): Promise<ReadSnapshot> {
+  const missing = missingReadMethods();
+  let readOnlyReason = missingMethodsReason(missing);
+  if (readOnlyReason && missing.includes('loadSyncedData')) return { entries: {}, readOnlyReason };
+
+  const collections = missing.includes('listSyncedDataKeys')
+    ? []
+    : await Promise.allSettled(
+        RECORD_PREFIXES.map(async (prefix) => PluginAPI.listSyncedDataKeys(prefix)),
+      );
+  const listed = new Set<string>();
+  for (const collection of collections) {
+    if (collection.status === 'fulfilled') {
+      for (const key of collection.value) listed.add(key);
+    } else {
+      readOnlyReason ??= 'Только чтение. Не удалось перечислить ключи для проверки схемы.';
     }
   }
-  return { entries: Object.fromEntries(known), ...(readOnlyReason && { readOnlyReason }) };
+  // Pending writes may be readable by key before they appear in the collection listing.
+  const keys = [...new Set([...listed, WIPE_KEY, ...additionalKeys.filter(isRecordKey)])];
+  const reads = await Promise.all(
+    keys.map(async (key) => [key, await readRecord(key, listed.has(key))] as const),
+  );
+  return snapshotFromReads(reads, readOnlyReason);
 }
 
 export function createHostFacade() {
   return {
-    async read(additionalKeys?: readonly string[]): Promise<ReadSnapshot> {
-      const snapshot = inspectRecords(await readRecords(additionalKeys));
-      const readOnlyReason = snapshot.readOnlyReason ?? missingMethodsReason(missingReadMethods());
-      return readOnlyReason ? { ...snapshot, readOnlyReason } : snapshot;
-    },
+    read: readRecords,
+    readBaseReferences,
+    linkedRecordKey,
     readSaveState(keys: string[]): Promise<SaveState> {
       return PluginAPI.getSyncedDataSaveState(keys);
     },
@@ -99,6 +185,8 @@ export function createHostFacade() {
 export interface EditorFacade extends Facade<PlanHandoff> {
   apply(plan: Plan, onIncomplete?: HandoffObserver): Promise<PlanHandoff>;
   read(keys?: readonly string[]): Promise<ReadSnapshot>;
+  readBaseReferences?: typeof readBaseReferences;
+  linkedRecordKey?: typeof linkedRecordKey;
   readSaveState(keys: string[]): Promise<SaveState>;
 }
 

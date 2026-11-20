@@ -1,7 +1,10 @@
 import { EDIT_INTERVAL_MS } from '../app/commands';
-import { classifyPlan, type Plan } from '../core/plan';
-import { inspectRecords, missingMethodsReason, missingReadMethods, readRecords } from './facade';
+import { classifyPlan, type Plan, type PlanState } from '../core/plan';
+import { decodeRecord, isBaseKey, type StoredRecord } from '../core/records';
+import { BASE_READ_METHODS, readBaseReferences, type BaseReferences } from './base-references';
+import { missingMethodsReason, missingReadMethods, readRecords } from './facade';
 import type { HandoffOptions, PlanHandoff } from './facade';
+import { linkedRecordSource, matchesLinkedRecord } from './linked-record-keys';
 
 const HOST_METHODS = [
   'onReady',
@@ -9,6 +12,7 @@ const HOST_METHODS = [
   'persistDataSynced',
   'getSyncedDataSaveState',
   'triggerSync',
+  ...BASE_READ_METHODS,
 ] as const;
 
 export function hostMethodsReason(): string | undefined {
@@ -20,8 +24,7 @@ export function hostMethodsReason(): string | undefined {
 
 export async function checkCompatibility(keys?: readonly string[]) {
   const state = await readRecords(keys);
-  const { readOnlyReason } = inspectRecords(state);
-  return { state, readOnlyReason: hostMethodsReason() ?? readOnlyReason };
+  return { state, readOnlyReason: hostMethodsReason() ?? state.readOnlyReason };
 }
 
 const rejectionMessages = {
@@ -32,12 +35,85 @@ const rejectionMessages = {
   'unsupported-version': 'Обновите плагин: неизвестная версия схемы плана.',
 };
 
+function assignmentKeys(record?: StoredRecord): string[] {
+  if (!record || !('kind' in record)) return [];
+  switch (record.kind) {
+    case 'initiative':
+      return [record.projectKey, record.krKey];
+    case 'task-meta':
+      return [
+        record.taskKey,
+        ...(record.initiativeKey ? [record.initiativeKey] : []),
+        ...(record.sphereTagKey ? [record.sphereTagKey] : []),
+        ...(record.directKrKeys ?? []),
+      ];
+    case 'annual-goal':
+    case 'objective':
+      return record.sphereTagKey ? [record.sphereTagKey] : [];
+    case 'kr':
+      return [];
+  }
+}
+
+function storedRecord(state: PlanState, key: string): StoredRecord | undefined {
+  const raw = state.entries[key];
+  if (raw === undefined) return undefined;
+  const decoded = decodeRecord(key, raw);
+  return decoded.ok ? decoded.value : undefined;
+}
+
+async function newAssignments(state: PlanState, { key, value }: Plan['writes'][number]) {
+  const target = decodeRecord(key, value);
+  if (!target.ok) throw new Error(rejectionMessages[target.reason]);
+  const current = storedRecord(state, key);
+  const source = linkedRecordSource(target.value);
+  if (
+    source !== undefined &&
+    !(await matchesLinkedRecord(key, source, linkedRecordSource(current) ?? source))
+  ) {
+    throw new Error('Некорректный ключ или исходная ссылка записи.');
+  }
+  const existing = new Set(assignmentKeys(current));
+  return assignmentKeys(target.value).filter((reference) => !existing.has(reference));
+}
+
+function baseGroup(reference: string): keyof BaseReferences | undefined {
+  if (isBaseKey(reference, 'project')) return 'projects';
+  if (isBaseKey(reference, 'task')) return 'tasks';
+  if (isBaseKey(reference, 'tag')) return 'tags';
+  return undefined;
+}
+
+async function verifyAssignments(state: PlanState, writes: Plan['writes']): Promise<void> {
+  const references = (
+    await Promise.all(writes.map((write) => newAssignments(state, write)))
+  ).flat();
+  const groups = new Set<keyof BaseReferences>();
+  for (const reference of references) {
+    const group = baseGroup(reference);
+    if (group) {
+      groups.add(group);
+    } else {
+      const record = storedRecord(state, reference);
+      if (!record || !('kind' in record)) throw new Error('Новая ссылка Telos недоступна.');
+    }
+  }
+  if (groups.size === 0) return;
+  const base = await readBaseReferences([...groups]);
+  for (const reference of references) {
+    const group = baseGroup(reference);
+    if (group && base[group]?.[reference] === undefined)
+      throw new Error('Новая ссылка на объект основы недоступна.');
+  }
+}
+
 async function applicableWrites(plan: Plan): Promise<Plan['writes']> {
   const { state, readOnlyReason } = await checkCompatibility(plan.writes.map(({ key }) => key));
   if (readOnlyReason) throw new Error(readOnlyReason);
 
   const classified = classifyPlan(state, plan);
   if (!classified.ok) throw new Error(rejectionMessages[classified.reason]);
+  await verifyAssignments(state, classified.writes);
   return classified.writes;
 }
 
@@ -56,16 +132,15 @@ export async function apply(
   options?: HandoffOptions,
   editCooldowns?: Map<string, Promise<void>>,
 ): Promise<PlanHandoff> {
+  // The interval can end while the asynchronous first check is still reading records.
+  const cooldowns = options?.paceEditing
+    ? plan.writes.map(({ key }) => editCooldowns?.get(key)).filter((wait) => wait !== undefined)
+    : [];
   let writes = await applicableWrites(plan);
-  if (options?.paceEditing && editCooldowns) {
-    const cooldowns = writes
-      .map(({ key }) => editCooldowns.get(key))
-      .filter((wait) => wait !== undefined);
-    if (cooldowns.length > 0) {
-      await Promise.all(cooldowns);
-      // Sync can replace the base while the plan waits for the write interval.
-      writes = await applicableWrites(plan);
-    }
+  if (writes.length > 0 && cooldowns.length > 0) {
+    await Promise.all(cooldowns);
+    // Sync can replace the base while the plan waits for the write interval.
+    writes = await applicableWrites(plan);
   }
 
   let transferred = 0;
