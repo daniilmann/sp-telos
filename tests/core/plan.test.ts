@@ -87,34 +87,21 @@ function cyrillicPadding(bytes: number): string {
   return 'я'.repeat(Math.floor(bytes / 2)) + 'x'.repeat(bytes % 2);
 }
 
-it('replays only the original measurement bytes and rejects reuse of its key', () => {
+it('adds a measurement beside its KR', () => {
   const key = 'kr-value:00000000-0000-4000-8000-000000000004';
-  const ver = version(2);
-  const record = { v: 2, ver, at, kind: 'kr-value', krKey, value: '12,5 кг' };
-  const write = { key, base: 'absent', value: canonicalJson(record) };
+  const value = canonicalJson({
+    v: 2,
+    ver: version(2),
+    at,
+    kind: 'kr-value',
+    krKey,
+    value: '12,5 кг',
+  });
+  const write = { key, base: 'absent', value };
   const plan: Plan = { v: 2, origin: 'manual', writes: [write] };
-  const before = { entries: { [krKey]: JSON.stringify(stored(kr, 1)) } };
-  const applied = { entries: { ...before.entries, [key]: write.value } };
-  expect.soft(classifyPlan(before, plan)).toEqual({ ok: true, writes: [write] });
-  expect.soft(applyPlan(before, plan)).toEqual(applied);
-  expect.soft(classifyPlan(applied, plan)).toEqual({ ok: true, writes: [] });
-  expect(applyPlan(applied, plan)).toEqual(applied);
-  const reformatted = { entries: { ...applied.entries, [key]: `${write.value}\n` } };
-  expectRejection(reformatted, plan, 'invalid');
-
-  for (const [raw, base, reason] of [
-    [canonicalJson({ ...record, value: 'Подмена' }), 'absent', 'invalid'],
-    [canonicalJson({ ...record, ver: version(3) }), 'absent', 'stale'],
-    [canonicalJson({ ...record, ver: version(3) }), ver, undefined],
-  ] as const) {
-    const attempt = { ...plan, writes: [{ key, base, value: raw }] };
-    expect
-      .soft(classifyPlan(applied, attempt))
-      .toMatchObject({ ok: false, ...(reason && { reason }) });
-    expect(applyPlan(applied, attempt)).toEqual(applied);
-  }
-  const deleted = { entries: { ...before.entries, [key]: canonicalJson(stored(tombstone, 3)) } };
-  expectRejection(deleted, plan, 'stale');
+  const state = { entries: { [krKey]: JSON.stringify(stored(kr, 1)) } };
+  expect.soft(classifyPlan(state, plan)).toEqual({ ok: true, writes: [write] });
+  expect(applyPlan(state, plan)).toEqual({ entries: { ...state.entries, [key]: value } });
 });
 
 it('applies a new version and skips the same plan on replay', () => {
@@ -254,6 +241,33 @@ describe('checks UTF-8 size and preserves history at the limit', () => {
       ],
     };
     expectRejection(empty, plan, 'size');
+  });
+
+  it('retains the previous closed KR and its history when a revision would overflow', () => {
+    const padBytes = maxBytes - utf8Size(JSON.stringify(stored(record, 1))) - 32;
+    const almostFull = {
+      ...record,
+      history: [
+        {
+          ...snapshot,
+          revisionReason: cyrillicPadding(padBytes) + snapshot.revisionReason,
+        },
+      ],
+    };
+    const currentValue = JSON.stringify(stored(almostFull, 1));
+    const state = { entries: { [krKey]: currentValue } };
+    const revised = reviseKr(almostFull, { ...kr, target: '7 minutes' }, 'New sampling method');
+    if (!revised.ok) throw new Error('Expected a valid revision of the closed KR');
+    const value = JSON.stringify(stored(revised.value, 2));
+    const plan: Plan = {
+      v: MODEL_VERSION,
+      origin: 'kr-revision',
+      writes: [{ key: krKey, base: version(1), value }],
+    };
+
+    expect(utf8Size(currentValue)).toBeLessThan(maxBytes);
+    expect(utf8Size(value)).toBeGreaterThan(maxBytes);
+    expectRejection(state, plan, 'size');
   });
 
   it('preserves a KR at the history limit even when an ordinary edit still fits', () => {

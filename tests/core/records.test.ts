@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { assert, describe, expect, it } from 'vitest';
-import { reviseKr, type GoalRecord } from '../../src/core/goals';
-import { applyPlan, buildPlan, classifyPlan, MODEL_VERSION } from '../../src/core/plan';
+import type { GoalRecord } from '../../src/core/goals';
+import { applyPlan, buildPlan, classifyPlan, MODEL_VERSION, type Plan } from '../../src/core/plan';
 import {
   canonicalJson,
   decodeRecord,
@@ -58,31 +58,25 @@ describe('KR measurement records', () => {
   const key = 'kr-value:00000000-0000-4000-8000-000000000009';
   const record = { v: 2, ver, at, kind: 'kr-value', krKey, value: '0' };
 
-  it('decodes a measurement and its tombstone under a separate key', () => {
+  it('decodes a measurement and its tombstone and rejects invalid or unsupported records', () => {
     const tombstone = { v: 2, ver, at, deleted: true };
     expect.soft(decodeRecord(key, canonicalJson(record))).toEqual({ ok: true, value: record });
-    expect(decodeRecord(key, canonicalJson(tombstone))).toEqual({ ok: true, value: tombstone });
-  });
-
-  it.each([
-    { v: 1 },
-    { value: '' },
-    { value: ' \t' },
-    { value: 0 },
-    { krKey: objectiveKey },
-    { extra: true },
-  ])('rejects a measurement with %j', (fields) => {
-    expect(decodeRecord(key, canonicalJson({ ...record, ...fields }))).toEqual({
-      ok: false,
-      reason: 'invalid',
-    });
-  });
-
-  it('reports an unknown measurement schema', () => {
-    expect(decodeRecord(key, canonicalJson({ ...record, v: 3 }))).toEqual({
-      ok: false,
-      reason: 'unsupported-version',
-    });
+    expect
+      .soft(decodeRecord(key, canonicalJson(tombstone)))
+      .toEqual({ ok: true, value: tombstone });
+    for (const [fields, reason] of [
+      [{ v: 1 }, 'invalid'],
+      [{ value: '' }, 'invalid'],
+      [{ value: ' \t' }, 'invalid'],
+      [{ value: 0 }, 'invalid'],
+      [{ krKey: objectiveKey }, 'invalid'],
+      [{ extra: true }, 'invalid'],
+      [{ v: 3 }, 'unsupported-version'],
+    ] as const) {
+      expect
+        .soft(decodeRecord(key, canonicalJson({ ...record, ...fields })), canonicalJson(fields))
+        .toEqual({ ok: false, reason });
+    }
   });
 
   it('counts the entire measurement in UTF-8 at the storage boundary', () => {
@@ -95,30 +89,57 @@ describe('KR measurement records', () => {
     expect.soft(decodeRecord(key, exact).ok).toBe(true);
     expect(decodeRecord(key, overflow)).toEqual({ ok: false, reason: 'size' });
   });
-});
 
-it('retains the previous closed KR and its history when a revision would overflow', () => {
-  const snapshot = kr.history[0];
-  const stored = { ...kr, v: 2, ver, at };
-  const padding = MAX_RECORD_BYTES - Buffer.byteLength(canonicalJson(stored)) - 32;
-  const history = [
-    { ...snapshot, revisionReason: snapshot.revisionReason + 'я'.repeat(Math.floor(padding / 2)) },
-  ];
-  const current = { ...kr, history };
-  const raw = canonicalJson({ ...stored, history });
-  const state = { entries: { [krKey]: raw } };
-  const revised = reviseKr(current, { ...kr, target: '6 минут' }, 'New sampling method');
-  assert(revised.ok);
-  const newVer = '10000000-0000-4000-8000-000000000002';
-  const plan = buildPlan('kr-revision', [{ key: krKey, base: ver, record: revised.value }], {
-    at,
-    newId: () => newVer,
+  it('replays only the original measurement bytes and rejects reuse of its key', () => {
+    const measurement = {
+      ...record,
+      ver: '10000000-0000-4000-8000-000000000002',
+      value: '12,5 кг',
+    };
+    const nextVer = '10000000-0000-4000-8000-000000000003';
+    const write = { key, base: 'absent', value: canonicalJson(measurement) };
+    const plan: Plan = { v: 2, origin: 'manual', writes: [write] };
+    const before = { entries: { [krKey]: canonicalJson({ ...kr, v: MODEL_VERSION, ver, at }) } };
+    const applied = { entries: { ...before.entries, [key]: write.value } };
+    expect.soft(classifyPlan(applied, plan)).toEqual({ ok: true, writes: [] });
+    expect.soft(applyPlan(applied, plan)).toEqual(applied);
+
+    const newer = canonicalJson({ ...measurement, ver: nextVer });
+    const cases = [
+      ['different stored bytes', `${write.value}\n`, write, 'invalid'],
+      [
+        'different value at the same version',
+        write.value,
+        { ...write, value: canonicalJson({ ...measurement, value: 'Подмена' }) },
+        'invalid',
+      ],
+      ['new version at the same key', write.value, { ...write, value: newer }, 'stale'],
+      [
+        'overwrite against the current version',
+        write.value,
+        { ...write, value: newer, base: measurement.ver },
+        undefined,
+      ],
+      [
+        'tombstoned measurement',
+        canonicalJson({ v: 2, ver: nextVer, at, deleted: true }),
+        write,
+        'stale',
+      ],
+    ] as const;
+    for (const [label, raw, attemptWrite, reason] of cases) {
+      const state = { entries: { ...before.entries, [key]: raw } };
+      const attempt = { ...plan, writes: [attemptWrite] };
+      const snapshot = structuredClone(state);
+      const originalPlan = structuredClone(attempt);
+      expect
+        .soft(classifyPlan(state, attempt), label)
+        .toMatchObject({ ok: false, ...(reason && { reason }) });
+      expect.soft(applyPlan(state, attempt), label).toEqual(snapshot);
+      expect.soft(state, label).toEqual(snapshot);
+      expect.soft(attempt, label).toEqual(originalPlan);
+    }
   });
-
-  expect(Buffer.byteLength(raw)).toBeLessThan(MAX_RECORD_BYTES);
-  expect(Buffer.byteLength(plan.writes[0]!.value)).toBeGreaterThan(MAX_RECORD_BYTES);
-  expect(classifyPlan(state, plan)).toEqual({ ok: false, reason: 'size' });
-  expect(applyPlan(state, plan)).toEqual({ entries: { [krKey]: raw } });
 });
 
 describe('round-trips each record with a child-to-parent key', () => {

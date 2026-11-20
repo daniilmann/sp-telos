@@ -119,6 +119,20 @@ afterEach(() => {
 });
 
 const krKey = 'kr:00000000-0000-4000-8000-000000000031';
+const parent = canonicalJson({
+  v: 1,
+  ver: versionOf(original),
+  at: 11,
+  kind: 'kr',
+  status: 'active',
+  objectiveKey: 'objective:00000000-0000-4000-8000-000000000030',
+  statement: 'Lead time',
+  baseline: '10 days',
+  target: '5 days',
+  dataSource: 'Release audit',
+  history: [],
+});
+const factEntries = { ...initial.entries, [krKey]: parent };
 const fact = {
   key: 'kr-value:00000000-0000-4000-8000-000000000032',
   base: 'absent',
@@ -131,7 +145,7 @@ const factCommand = { cmd: 'apply', plan: factPlan, ...absentGuard } as const;
 const noVersion = { ...factPlan };
 Reflect.deleteProperty(noVersion, 'v');
 
-it.each([
+const invalidFactCommands = [
   ['no guard', {}],
   ['missing expectedWipe', { byteCheck: factCommand.byteCheck }],
   ['missing byteCheck', { expectedWipe: factCommand.expectedWipe }],
@@ -145,25 +159,33 @@ it.each([
   ['bad key', { ...factCommand, plan: manualPlan({ ...fact, key: 'kr-value:bad' }) }],
   ['wrong record type', { ...factCommand, plan: manualPlan({ ...fact, value: edit.value }) }],
   ['missing plan v', { ...factCommand, plan: noVersion }],
-] as const)('rejects a fact command with %s before enqueueing', async (_label, fields) => {
-  const host = await startHost();
+] as const;
+
+it('queues a valid fact command and rejects malformed commands before enqueueing', async () => {
+  const host = await startHost(factEntries);
+  const { loadSyncedData, persistDataSynced, triggerSync } = host.api;
   const view = await createBridge(host).open();
   const { entered, release } = holdFirstWrite(host);
   const ahead = view.send(command());
   try {
     await Promise.race([entered.promise, ahead]);
-    host.api.loadSyncedData.mockClear();
-    const request = { cmd: 'apply', plan: factPlan, forceSync: true, ...fields } as const;
-    const result = view.send(request).catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(0);
+    loadSyncedData.mockClear();
     const error = expect.stringMatching(/некорректная команда/i);
-    const response = { type: 'PLUGIN_MESSAGE_ERROR', error };
-    expect.soft(view.reply.mock.lastCall?.[0]).toMatchObject(response);
+    for (const [label, fields] of invalidFactCommands) {
+      const request = { cmd: 'apply', plan: factPlan, forceSync: true, ...fields } as const;
+      void view.send(request).catch(() => undefined);
+      const [{ messageId }] = view.postMessage.mock.lastCall!;
+      await vi.advanceTimersByTimeAsync(0);
+      const response = { type: 'PLUGIN_MESSAGE_ERROR', messageId, error };
+      expect.soft(view.reply.mock.lastCall?.[0], label).toMatchObject(response);
+    }
     release.resolve();
-    await result;
-    expect.soft(host.api.loadSyncedData).not.toHaveBeenCalled();
-    expect(host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(edit.value, edit.key);
-    expect(host.api.triggerSync).not.toHaveBeenCalled();
+    await Promise.all(view.deliveries);
+    expect.soft(loadSyncedData).not.toHaveBeenCalled();
+    expect.soft(persistDataSynced).toHaveBeenCalledExactlyOnceWith(edit.value, edit.key);
+    expect.soft(triggerSync).not.toHaveBeenCalled();
+    await expect(view.send(factCommand)).resolves.toMatchObject({ transferred: 1 });
+    expect(persistDataSynced).toHaveBeenLastCalledWith(fact.value, fact.key);
   } finally {
     release.resolve();
     await ahead;
@@ -291,88 +313,71 @@ it('requests sync for a retry handed to the executor before the form closes', as
   }
 });
 
-it.each(['editor', 'fact replay', 'fact replay after wipe'] as const)(
-  're-reads after a timed-out %s request and keeps the queue locked',
-  async (scenario) => {
-    const isFact = scenario !== 'editor';
-    const wipeChanged = scenario === 'fact replay after wipe';
-    const parent = canonicalJson({
-      v: 1,
-      ver: versionOf(original),
-      at: 11,
-      kind: 'kr',
-      status: 'active',
-      objectiveKey: 'objective:00000000-0000-4000-8000-000000000030',
-      statement: 'Lead time',
-      baseline: '10 days',
-      target: '5 days',
-      dataSource: 'Release audit',
-      history: [],
-    });
-    const expectedWipe = versionOf(goalWrite(2, 21));
-    const marker = canonicalJson({ v: 2, ver: expectedWipe, at: 21 });
-    const entries = isFact
-      ? { ...initial.entries, [krKey]: parent, [WIPE_KEY]: marker }
-      : initial.entries;
-    const host = await startHost(entries);
-    const view = await createBridge(host).open();
-    const { entered, release } = holdFirstWrite(host);
-    const firstWrite = isFact ? fact : edit;
-    const firstCommand = { ...factCommand, expectedWipe };
-    const first = view.send(isFact ? firstCommand : command()).catch((error: unknown) => error);
-    try {
-      expect(await Promise.race([entered.promise, first])).toBeUndefined();
-      const { loadSyncedData, persistDataSynced, triggerSync } = host.api;
-      loadSyncedData.mockClear();
-      await vi.advanceTimersByTimeAsync(29_999);
-      expect(loadSyncedData).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(await first).toMatchObject({ message: expect.stringMatching(/unknown|неизвест/i) });
-      expect(loadSyncedData).toHaveBeenCalledWith(firstWrite.key);
-      expect(host.committed().entries).toEqual(entries);
-      loadSyncedData.mockClear();
+it.each([
+  ['re-reads after a timed-out reply without unlocking the queue', 'editor'],
+  ['re-reads after a timed-out fact replay request and keeps the queue locked', 'fact replay'],
+  ['re-reads after a timed-out fact replay after wipe and keeps the queue locked', 'wipe'],
+] as const)('%s', async (_title, scenario) => {
+  const isFact = scenario !== 'editor';
+  const wipeChanged = scenario === 'wipe';
+  const expectedWipe = versionOf(goalWrite(2, 21));
+  const marker = canonicalJson({ v: 2, ver: expectedWipe, at: 21 });
+  const entries = isFact ? { ...factEntries, [WIPE_KEY]: marker } : initial.entries;
+  const host = await startHost(entries);
+  const view = await createBridge(host).open();
+  const { entered, release } = holdFirstWrite(host);
+  const firstWrite = isFact ? fact : edit;
+  const firstCommand = { ...factCommand, expectedWipe };
+  const first = view.send(isFact ? firstCommand : command()).catch((error: unknown) => error);
+  try {
+    expect(await Promise.race([entered.promise, first])).toBeUndefined();
+    const { loadSyncedData, persistDataSynced, triggerSync } = host.api;
+    loadSyncedData.mockClear();
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(loadSyncedData).not.toHaveBeenCalled();
+    expect(view.reply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await first).toMatchObject({ message: expect.stringMatching(/unknown|неизвест/i) });
+    expect(loadSyncedData).toHaveBeenCalledWith(firstWrite.key);
+    expect(host.committed().entries).toEqual(entries);
+    loadSyncedData.mockClear();
 
-      const retry = { ...firstCommand, forceSync: true } as const;
-      const second = view.send(isFact ? retry : command(next)).catch((error: unknown) => error);
-      const independent = isFact && view.send(command()).catch((error: unknown) => error);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(loadSyncedData).not.toHaveBeenCalled();
-      expect(persistDataSynced).toHaveBeenCalledExactlyOnceWith(firstWrite.value, firstWrite.key);
-      expect(view.reply).not.toHaveBeenCalled();
-      const wipe = canonicalJson({ v: 2, ver: versionOf(next), at: 13 });
-      if (wipeChanged) host.receiveSync(WIPE_KEY, wipe);
-      release.resolve();
+    const retry = { ...firstCommand, forceSync: true } as const;
+    const second = view.send(isFact ? retry : command(next)).catch((error: unknown) => error);
+    const independent = isFact && view.send(command()).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loadSyncedData).not.toHaveBeenCalled();
+    expect(persistDataSynced).toHaveBeenCalledExactlyOnceWith(firstWrite.value, firstWrite.key);
+    expect(view.reply).not.toHaveBeenCalled();
+    const wipe = canonicalJson({ v: 2, ver: versionOf(next), at: 13 });
+    if (wipeChanged) host.receiveSync(WIPE_KEY, wipe);
+    release.resolve();
 
-      expect(await second).toMatchObject(
-        wipeChanged ? expect.any(Error) : { transferred: isFact ? 0 : 1 },
-      );
-      if (isFact) expect(await independent).toMatchObject({ transferred: 1 });
-      expect(triggerSync).toHaveBeenCalledTimes(isFact && !wipeChanged ? 1 : 0);
-      const last = isFact ? edit : next;
-      const calls = [firstWrite, last].map(({ value, key }) => [value, key]);
-      expect(persistDataSynced.mock.calls).toEqual(calls);
-      const ids = view.postMessage.mock.calls.map(([wire]) => wire.messageId);
-      expect(new Set(ids).size).toBe(ids.length);
-      const replies = view.reply.mock.calls.map(([reply]) => reply);
-      expect(replies.map(({ messageId }) => messageId)).toEqual(ids);
-      const errors = replies.filter(({ type }) => type === 'PLUGIN_MESSAGE_ERROR');
-      expect(errors).toHaveLength(Number(wipeChanged));
-      await host.commitAfter(Promise.resolve());
-      expect(host.committed().entries).toEqual({
-        ...entries,
-        [firstWrite.key]: firstWrite.value,
-        [last.key]: last.value,
-        ...(wipeChanged && { [WIPE_KEY]: wipe }),
-      });
-    } finally {
-      release.resolve();
-    }
-  },
-);
+    const outcome = wipeChanged ? expect.any(Error) : { transferred: isFact ? 0 : 1 };
+    expect(await second).toMatchObject(outcome);
+    if (isFact) expect(await independent).toMatchObject({ transferred: 1 });
+    await Promise.all(view.deliveries);
+    expect(triggerSync).toHaveBeenCalledTimes(isFact && !wipeChanged ? 1 : 0);
+    const writes = [firstWrite, isFact ? edit : next];
+    expect(persistDataSynced.mock.calls).toEqual(writes.map(({ value, key }) => [value, key]));
+    const ids = view.postMessage.mock.calls.map(([wire]) => wire.messageId);
+    expect(new Set(ids).size).toBe(ids.length);
+    const replies = view.reply.mock.calls.map(([reply]) => reply);
+    expect(replies.map(({ messageId }) => messageId)).toEqual(ids);
+    const errors = replies.filter(({ type }) => type === 'PLUGIN_MESSAGE_ERROR');
+    expect(errors).toHaveLength(Number(wipeChanged));
+    await host.commitAfter(Promise.resolve());
+    const saved = Object.fromEntries(writes.map(({ key, value }) => [key, value]));
+    const markers = wipeChanged ? { [WIPE_KEY]: wipe } : {};
+    expect(host.committed().entries).toEqual({ ...entries, ...saved, ...markers });
+  } finally {
+    release.resolve();
+  }
+});
 
 it.each([
-  ['reports a plan still incomplete at 60 seconds', false],
-  ['does not report a completed plan whose reply was lost', true],
+  ['reports a plan still incomplete after 60 seconds', false],
+  ['does not report a completed plan as incomplete when its reply is lost', true],
 ] as const)('%s', async (_label, completed) => {
   const host = await startHost();
   const dropReply = vi.fn((_answer: Reply, message: Request['message']) => message.cmd === 'apply');
@@ -387,6 +392,7 @@ it.each([
     await vi.advanceTimersByTimeAsync(30_000);
     expect(await first).toMatchObject({ message: expect.stringMatching(/unknown|неизвест/i) });
     expect(onReread).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(initial));
+    expect(onIncomplete).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
     const second = completed ? undefined : view.send(command(next));
@@ -405,25 +411,20 @@ it.each([
     expect(view.reply).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(message).toMatchObject({ cmd: 'apply', requestId: applyId });
-    const [statusWire] = view.postMessage.mock.lastCall!;
-    expect(statusWire.message).toEqual({ cmd: 'isApplying', requestId: applyId });
-    const status = {
-      type: 'PLUGIN_MESSAGE_RESPONSE',
-      messageId: statusWire.messageId,
-      result: !completed,
-    };
-    expect(view.reply).toHaveBeenCalledExactlyOnceWith(status);
+    const { messageId, message: status } = view.postMessage.mock.lastCall![0];
+    expect(status).toEqual({ cmd: 'isApplying', requestId: applyId });
+    const response = { type: 'PLUGIN_MESSAGE_RESPONSE', messageId, result: !completed };
+    expect(view.reply).toHaveBeenCalledExactlyOnceWith(response);
     expect(host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(edit.value, edit.key);
-    if (completed) {
-      expect(onIncomplete).not.toHaveBeenCalled();
-    } else {
-      expect(onIncomplete).toHaveBeenCalledExactlyOnceWith(
-        'Запись не завершена — перезапустите приложение',
-      );
+    const notification = 'Запись не завершена — перезапустите приложение';
+    expect(onIncomplete.mock.calls).toEqual(completed ? [] : [[notification]]);
+    if (!completed) {
       release.resolve();
       await second;
-      expect(host.api.persistDataSynced).toHaveBeenLastCalledWith(next.value, next.key);
-      expect(host.api.persistDataSynced).toHaveBeenCalledTimes(2);
+      expect(host.api.persistDataSynced.mock.calls).toEqual([
+        [edit.value, edit.key],
+        [next.value, next.key],
+      ]);
     }
   } finally {
     release.resolve();

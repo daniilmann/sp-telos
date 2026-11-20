@@ -88,7 +88,29 @@ describe('Apply a measurement', () => {
   );
   const guard = { expectedWipe: 'absent', byteCheck: 'allow-absent', forceSync: true } as const;
 
-  it('writes beside a closed KR, reading the exact fact before and after enumeration', async () => {
+  it('accepts and replays a measurement beside a closed KR and rejects unsafe handoffs', async () => {
+    for (const [failure, parents, wipe] of [
+      ['missing parent', [], undefined],
+      ['deleted parent', [write(krKey, deleted, 53)], undefined],
+      ['wipe read error', [parent], new Error('Read failed')],
+      ['damaged wipe', [parent], '{'],
+      ['missing observed bytes', [parent], undefined],
+    ] as const) {
+      const host = linkedHost(...parents);
+      vi.stubGlobal('PluginAPI', host.api);
+      if (typeof wipe === 'string') host.receiveSync(WIPE_KEY, wipe);
+      if (wipe instanceof Error) {
+        const load = host.api.loadSyncedData.getMockImplementation()!;
+        host.api.loadSyncedData.mockImplementation((key) =>
+          key === WIPE_KEY ? Promise.reject(wipe) : load(key),
+        );
+      }
+      const byteCheck = failure === 'missing observed bytes' ? 'require-exact' : guard.byteCheck;
+      const options = { ...guard, byteCheck } as const;
+      await expect.soft(apply(plan, options), failure).rejects.toThrow();
+      expect.soft(host.api.persistDataSynced, failure).not.toHaveBeenCalled();
+      expect.soft(host.api.triggerSync, failure).not.toHaveBeenCalled();
+    }
     const host = linkedHost(parent);
     vi.stubGlobal('PluginAPI', host.api);
     await expect(apply(plan, guard)).resolves.toMatchObject({ transferred: 1 });
@@ -100,29 +122,6 @@ describe('Apply a measurement', () => {
     const replay = { ...guard, byteCheck: 'require-exact' } as const;
     await expect(apply(plan, replay)).resolves.toMatchObject({ transferred: 0 });
     expect(host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(value, key);
-  });
-
-  it.each([
-    ['missing parent', [], undefined],
-    ['deleted parent', [write(krKey, deleted, 53)], undefined],
-    ['wipe read error', [parent], new Error('Read failed')],
-    ['damaged wipe', [parent], '{'],
-    ['missing observed bytes', [parent], undefined],
-  ] as const)('rejects %s without write or sync', async (failure, parents, wipe) => {
-    const host = linkedHost(...parents);
-    vi.stubGlobal('PluginAPI', host.api);
-    if (typeof wipe === 'string') host.receiveSync(WIPE_KEY, wipe);
-    if (wipe instanceof Error) {
-      const load = host.api.loadSyncedData.getMockImplementation()!;
-      host.api.loadSyncedData.mockImplementation((key) =>
-        key === WIPE_KEY ? Promise.reject(wipe) : load(key),
-      );
-    }
-    const byteCheck = failure === 'missing observed bytes' ? 'require-exact' : guard.byteCheck;
-    const options = { ...guard, byteCheck } as const;
-    await expect.soft(apply(plan, options)).rejects.toThrow();
-    expect(host.api.persistDataSynced).not.toHaveBeenCalled();
-    expect(host.api.triggerSync).not.toHaveBeenCalled();
   });
 });
 

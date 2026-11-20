@@ -71,38 +71,38 @@ describe('Required save method or known schema is unavailable', () => {
   });
 
   it.each([
-    ['a newer goal', goalWrite(2, 21).key, MODEL_VERSION + 1],
-    ['a newer measurement', 'kr-value:00000000-0000-4000-8000-000000000021', 3],
-    ['a measurement without v', 'kr-value:00000000-0000-4000-8000-000000000021', undefined],
-  ])('finds %s outside writes after onReady', async (_label, key, v) => {
+    ['finds a newer synchronized schema outside writes after onReady', MODEL_VERSION + 1, false],
+    ['finds a newer measurement outside writes after onReady', 3, true],
+    ['finds a measurement without v outside writes after onReady', undefined, true],
+  ])('%s', async (_title, v, measurement) => {
     const host = await startHost(initial);
-    const startupReads = host.api.loadSyncedData.mock.calls.slice();
+    const { loadSyncedData, persistDataSynced, triggerSync } = host.api;
+    expect(loadSyncedData).toHaveBeenCalledWith(original.key);
+    const later = goalWrite(2, 21);
+    const envelope = { v, ver: versionOf(later), at: 21 };
     const body = {
-      ver: versionOf(goalWrite(2, 21)),
-      at: 21,
+      ...envelope,
       kind: 'kr-value',
       krKey: 'kr:00000000-0000-4000-8000-000000000022',
       value: 'Наблюдение',
     };
+    const key = measurement ? 'kr-value:00000000-0000-4000-8000-000000000021' : later.key;
     const knownKey = 'kr-value:00000000-0000-4000-8000-000000000023';
     const known = canonicalJson({ ...body, v: 2, ver: versionOf(goalWrite(3, 31)) });
-    const record = canonicalJson({ ...body, v });
+    const record = canonicalJson(measurement ? body : { ...envelope, title: 'Новый формат' });
     host.receiveSync(key, record);
-    const measurement = key.startsWith('kr-value:');
     if (measurement) host.receiveSync(knownKey, known);
-    const snapshot = await host.read();
-    expect
-      .soft(snapshot.entries)
-      .toEqual({ ...initial.entries, ...(measurement && { [knownKey]: known }) });
-    host.api.loadSyncedData.mockClear();
+    loadSyncedData.mockClear();
     const result = host.deliver({ cmd: 'apply', plan: manualPlan(edit), forceSync: true });
     await expect.soft(result).rejects.toThrow(/schema|version|схем|верси|плагин/i);
-
-    expect.soft(host.api.persistDataSynced).not.toHaveBeenCalled();
-    expect.soft(host.api.triggerSync).not.toHaveBeenCalled();
+    expect.soft(loadSyncedData).toHaveBeenCalledWith(key);
+    expect.soft(persistDataSynced).not.toHaveBeenCalled();
+    expect.soft(triggerSync).not.toHaveBeenCalled();
     expect(host.committed().entries[key]).toBe(record);
-    expect(startupReads).toContainEqual([original.key]);
-    expect(host.api.loadSyncedData).toHaveBeenCalledWith(key);
+    const { entries } = await host.read();
+    expect.soft(entries).toEqual({ ...initial.entries, ...(measurement && { [knownKey]: known }) });
+    const originalRecord = decodeRecord(original.key, entries[original.key]!);
+    expect(originalRecord).toMatchObject({ ok: true, value: { ver: versionOf(original) } });
   });
 });
 
