@@ -175,9 +175,23 @@ const browserScenarios = {
   ],
 };
 
-function completedBrowserReport() {
+const linkedBrowserScenarios = {
+  'initiative-task-links.spec.ts': [
+    'Mark a project and reopen the same initiative',
+    'Move a task or change its initiative without rewriting direct KR',
+    'Resolve renamed base objects by their original IDs',
+  ],
+  'initiative-task-sync.spec.ts': [
+    'Resolve either delivery order and return of the original ID',
+    'Converge concurrent changes by whole key',
+    'Confirm on the writer and read independently on a second client',
+  ],
+  'initiative-task-backup.spec.ts': ['Import a full synthetic backup in an isolated profile'],
+};
+
+function completedBrowserReport(scenarios: Record<string, string[]> = browserScenarios) {
   return {
-    suites: Object.entries(browserScenarios).map(([file, titles]) => ({
+    suites: Object.entries(scenarios).map(([file, titles]) => ({
       title: file,
       file,
       specs: titles.map((title, index) => ({
@@ -185,24 +199,43 @@ function completedBrowserReport() {
         file,
         id: `${file}-${String(index)}`,
         ok: true,
-        tests: [{ expectedStatus: 'passed', status: 'expected', results: [{ status: 'passed' }] }],
+        tests: [
+          {
+            expectedStatus: 'passed',
+            status: 'expected',
+            results: [{ status: 'passed' }] as { status: string; retry?: number }[],
+          },
+        ],
       })),
     })),
   };
 }
 
-function validateBrowserReport(report: ReturnType<typeof completedBrowserReport>) {
+function validateBrowserReport(
+  report: ReturnType<typeof completedBrowserReport>,
+  stage: 'original' | 'candidate' = 'original',
+) {
   const browser = gate.jobs.browser!;
   checkRequiredStep(browser, stand);
   const run = browser.steps?.find((step) => stand.test(step.run ?? ''))?.run ?? '';
   const lines = run.split('\n');
   const playwright = lines.findIndex((line) => stand.test(line));
-  const validator = lines
+  const workflowValidator = lines
     .slice(playwright + 1)
     .join('\n')
     .trim();
   expect(playwright).toBeGreaterThanOrEqual(0);
-  expect(validator, 'The browser job must validate the reported results').not.toBe('');
+  expect(workflowValidator, 'The browser job must validate the reported results').not.toBe('');
+  const requiredList = /def required_scenarios:\s*\{[^}]+\}/;
+  expect(workflowValidator).toMatch(requiredList);
+  // Keep the original checks on their release's list while running the workflow's predicate.
+  const validator =
+    stage === 'original'
+      ? workflowValidator.replace(
+          requiredList,
+          `def required_scenarios: ${JSON.stringify(browserScenarios)}`,
+        )
+      : workflowValidator;
 
   // Playwright can exit successfully with an incomplete selection. Exercise the shell
   // that consumes its JSON after that exit, without starting the browser stand.
@@ -272,6 +305,49 @@ it.each([
   const result = validateBrowserReport(report);
   expect(result.status, result.stderr).toBeGreaterThan(0);
 });
+
+const candidateReport = () =>
+  completedBrowserReport({ ...browserScenarios, ...linkedBrowserScenarios });
+
+it('accepts the candidate report with all nineteen required browser scenarios passed once', () => {
+  const report = candidateReport();
+  expect(report.suites.flatMap(({ specs }) => specs)).toHaveLength(19);
+  expect(validateBrowserReport(report, 'original').status).toBe(1);
+  const result = validateBrowserReport(report, 'candidate');
+  expect(result.status, result.stderr).toBe(0);
+});
+
+it.each(['missing', 'extra', 'duplicate', 'skipped', 'retried', 'failed'] as const)(
+  'rejects a candidate report with a %s scenario',
+  (change) => {
+    const report = candidateReport();
+    const specs = report.suites.find(({ file }) => file === 'initiative-task-links.spec.ts')!.specs;
+    const spec = specs[0]!;
+    const test = spec.tests[0]!;
+    switch (change) {
+      case 'missing':
+        specs.shift();
+        break;
+      case 'extra':
+        specs.push({ ...spec, title: 'Unlisted scenario' });
+        break;
+      case 'duplicate':
+        specs[1] = structuredClone(spec);
+        break;
+      case 'skipped':
+        test.expectedStatus = 'skipped';
+        break;
+      case 'retried':
+        test.results = [{ status: 'passed', retry: 1 }];
+        break;
+      case 'failed':
+        test.results = [{ status: 'failed' }];
+        break;
+    }
+    const result = validateBrowserReport(report, 'candidate');
+    expect(result.status, result.stderr).toBe(1);
+  },
+);
 
 it('branch and manual runs cannot publish', () => {
   expect(canWriteContents(gate.permissions)).toBe(false);
