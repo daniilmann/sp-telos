@@ -17,6 +17,7 @@ export { MODEL_VERSION };
 
 export interface PlanState {
   readonly entries: Readonly<Record<string, string>>;
+  readonly unreadKeys?: readonly string[];
 }
 
 type PlanOrigin = 'manual' | 'kr-revision';
@@ -120,6 +121,17 @@ function preservesHistory(
   return expected.ok && canonicalJson(expected.value) === canonicalJson(targetBody);
 }
 
+function preservesSourceReference(target: StoredRecord, current: StoredRecord): boolean {
+  if (!('kind' in target) || !('kind' in current)) return true;
+  if (target.kind === 'initiative' && current.kind === 'initiative') {
+    return target.projectKey === current.projectKey;
+  }
+  if (target.kind === 'task-meta' && current.kind === 'task-meta') {
+    return target.taskKey === current.taskKey;
+  }
+  return true;
+}
+
 function classifyWrite(
   state: PlanState,
   origin: PlanOrigin,
@@ -127,6 +139,7 @@ function classifyWrite(
   target: StoredRecord,
 ): 'write' | 'replay' | Rejection {
   if (write.base === target.ver) return 'invalid';
+  if (state.unreadKeys?.includes(write.key)) return 'invalid';
 
   const historyLength = asKr(target)?.history.length ?? 0;
   if (origin === 'kr-revision' && (write.base === 'absent' || historyLength === 0)) {
@@ -147,6 +160,7 @@ function classifyWrite(
   if (current.value.ver !== write.base || ('deleted' in current.value && !('deleted' in target))) {
     return 'stale';
   }
+  if (!preservesSourceReference(target, current.value)) return 'invalid';
 
   const currentHistory = asKr(current.value)?.history;
   if (currentHistory?.length && recordByteLength(raw) === MAX_RECORD_BYTES) return 'history';
@@ -166,6 +180,7 @@ export function classifyPlan(state: PlanState, plan: Plan): Classification {
 
     const target = decodeRecord(write.key, write.value);
     if (!target.ok) return target;
+    if (target.value.v !== MODEL_VERSION) return { ok: false, reason: 'unsupported-version' };
     if (versions.has(target.value.ver)) return { ok: false, reason: 'invalid' };
     versions.add(target.value.ver);
 
@@ -185,5 +200,5 @@ export function applyPlan(state: PlanState, plan: Plan): PlanState {
 
   const entries = { ...state.entries };
   for (const { key, value } of classified.writes) entries[key] = value;
-  return { entries };
+  return { ...state, entries };
 }

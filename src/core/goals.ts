@@ -31,15 +31,13 @@ type Closed<Outcome extends string> = {
   readonly closureReason: string;
 };
 
-export type AnnualGoal = AnnualGoalDraft & { readonly kind: 'annual-goal' } & (
-    | Active
-    | Closed<GoalOutcome>
-  );
+type SphereAssignment = { readonly sphereTagKey?: string };
 
-export type Objective = ObjectiveDraft & { readonly kind: 'objective' } & (
-    | Active
-    | Closed<GoalOutcome>
-  );
+export type AnnualGoal = AnnualGoalDraft &
+  SphereAssignment & { readonly kind: 'annual-goal' } & (Active | Closed<GoalOutcome>);
+
+export type Objective = ObjectiveDraft &
+  SphereAssignment & { readonly kind: 'objective' } & (Active | Closed<GoalOutcome>);
 
 type KrVersion = LinkedKrDraft & { readonly kind: 'kr' } & (Active | Closed<KrOutcome>);
 type KrRevision = KrVersion & { readonly revisionReason: string };

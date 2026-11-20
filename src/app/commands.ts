@@ -20,6 +20,7 @@ import {
   isUuid,
   splitRecord,
   WIPE_KEY,
+  type StoredGoalRecord,
   type StoredRecord,
 } from '../core/records';
 import type { Draft, DraftStore } from '../platform/draft-store';
@@ -67,18 +68,22 @@ export interface GoalIntent {
   readonly fields: GoalFields;
 }
 
+function isEditorRecord(record: StoredRecord): record is StoredGoalRecord {
+  return !('kind' in record) || (record.kind !== 'initiative' && record.kind !== 'task-meta');
+}
+
 export function goalRecords(state: PlanState) {
   const records: Record<string, GoalRecord & { readonly ver: string }> = {};
-  for (const [key, raw] of Object.entries(state.entries)) {
-    const decoded = decodeRecord(key, raw);
-    if (decoded.ok && 'kind' in decoded.value) records[key] = decoded.value;
+  for (const key of Object.keys(state.entries)) {
+    const record = recordAt(state, key);
+    if (record && 'kind' in record) records[key] = record;
   }
   return records;
 }
 
-export function recordAt(state: PlanState, key: string): StoredRecord | undefined {
+export function recordAt(state: PlanState, key: string): StoredGoalRecord | undefined {
   const decoded = decodeRecord(key, state.entries[key] ?? '');
-  return decoded.ok ? decoded.value : undefined;
+  return decoded.ok && isEditorRecord(decoded.value) ? decoded.value : undefined;
 }
 
 export function draftIntent(draft: Draft): GoalIntent | undefined {
@@ -93,7 +98,7 @@ export function draftIntent(draft: Draft): GoalIntent | undefined {
   return { action, fields: strings };
 }
 
-export function recordIntent(record?: StoredRecord | GoalRecord): GoalIntent {
+export function recordIntent(record?: StoredGoalRecord | GoalRecord): GoalIntent {
   if (!record || !('kind' in record)) return { action: 'create', fields: {} };
   const fields: Record<string, string> = { statement: record.statement };
   if (record.kind === 'objective') {
@@ -111,7 +116,7 @@ export function recordIntent(record?: StoredRecord | GoalRecord): GoalIntent {
 
 export function transition(
   kind: string | undefined,
-  current: StoredRecord | undefined,
+  current: StoredGoalRecord | undefined,
   { action, fields }: GoalIntent,
   state: PlanState,
 ): Result<GoalRecord> | undefined {
@@ -159,7 +164,7 @@ export const absent = 'absent';
 export type DraftChoice = 'keep-draft' | 'use-saved' | 'discard-draft' | 'restore-as-new';
 
 export function draftChoices(
-  record: StoredRecord | undefined,
+  record: StoredGoalRecord | undefined,
   baseVer: string,
 ): DraftChoice[] | undefined {
   if ('deleted' in (record ?? {}) || (!record && baseVer !== absent))
@@ -181,7 +186,7 @@ interface PlanPreparation {
 
 type Prepared =
   | { readonly plan: Plan; readonly write: Plan['writes'][number] }
-  | { readonly choices: DraftChoice[]; readonly record: StoredRecord | undefined }
+  | { readonly choices: DraftChoice[]; readonly record: StoredGoalRecord | undefined }
   | { readonly message: string; readonly errors: readonly GoalError[] };
 
 export function prepareGoalPlan({
@@ -226,7 +231,7 @@ export interface EditorView {
   readonly key: string;
   readonly baseVer: string;
   readonly intent: GoalIntent;
-  readonly record?: StoredRecord | undefined;
+  readonly record?: StoredGoalRecord | undefined;
   readonly errors: readonly GoalError[];
   readonly message?: string | undefined;
   readonly draftMessage?: string | undefined;
@@ -344,7 +349,7 @@ export function afterWipe(
   };
 }
 
-export function afterDraftDiscard(record?: StoredRecord): Partial<EditorView> {
+export function afterDraftDiscard(record?: StoredGoalRecord): Partial<EditorView> {
   return {
     intent: recordIntent(record),
     baseVer: record?.ver ?? absent,
