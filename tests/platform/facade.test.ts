@@ -1,5 +1,6 @@
 import { build } from 'esbuild';
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import {
   isValidElement,
   toChildArray,
@@ -223,7 +224,7 @@ it('matches applyPlan after asynchronous coalesced commits', async () => {
     keys: { [secondEdit.key]: { state: 'unknown' } },
   });
   host.acknowledge(secondEdit.key, 1234);
-  const expectedHash = '9124154de8210201e8192cda30a53f2ffb516d2ae70b566b503bd2718f9bb522';
+  const expectedHash = createHash('sha256').update(secondEdit.value, 'utf8').digest('hex');
   expect(await host.api.getSyncedDataSaveState([secondEdit.key])).toEqual({
     sync: 'ok',
     keys: { [secondEdit.key]: { state: 'saved', savedAt: 1234, valueSha256: expectedHash } },
