@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createGoalEditor } from '../../src/app/goal-editor';
 import { buildPlan } from '../../src/core/plan';
+import { decodeRecord, WIPE_KEY } from '../../src/core/records';
 import { createDraftStore, type Draft } from '../../src/platform/draft-store';
 import { createHostFacade } from '../../src/platform/facade';
 import { linkedRecordKey } from '../../src/platform/linked-record-keys';
 import { apply } from '../../src/platform/sp-facade';
 import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
-import { baseAppState, baseProject, createFakeHost } from '../fakes/fake-facade';
+import { baseAppState, baseProject, createFakeHost, versionOf } from '../fakes/fake-facade';
 
 const at = Date.UTC(2026, 10, 18);
 const uuid = (n: number) => `50000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -286,3 +287,87 @@ async function finishMutations(f: Awaited<ReturnType<typeof fixture>>, moving: P
     expect(done).toHaveBeenCalledOnce();
   });
 }
+
+it.each(['before the source read', 'between source and destination reads'] as const)(
+  'asks before moving a draft when wipe arrives %s',
+  async (arrival) => {
+    const f = await fixture();
+    const wipe = buildPlan('manual', [{ key: WIPE_KEY, base: 'absent', record: {} }], {
+      at,
+      newId: () => uuid(16),
+    }).writes[0]!;
+    const deliver = () => f.host.receiveSync(WIPE_KEY, wipe.value);
+    const load = f.host.api.loadSyncedData.getMockImplementation()!;
+    const observations: (string | null)[] = [];
+    f.host.api.loadSyncedData.mockImplementation(async (key) => {
+      const value = await load(key);
+      if (key === WIPE_KEY) {
+        observations.push(value);
+        if (observations.length === 1 && arrival === 'between source and destination reads')
+          deliver();
+      }
+      return value;
+    });
+    if (arrival === 'before the source read') deliver();
+
+    const mutations = f.database.mutations.length;
+    await finishMutations(f, f.restore());
+    if (arrival === 'before the source read') expect(observations[0]).toBe(wipe.value);
+    else expect(observations.slice(0, 2)).toEqual([null, wipe.value]);
+    expect.soft(f.database.mutations).toHaveLength(mutations);
+    expect.soft(f.disk().get(f.destinationKey)).toBeUndefined();
+    expect.soft(f.form.view().key).toBe(f.sourceKey);
+    expect.soft(f.host.api.persistDataSynced).not.toHaveBeenCalled();
+    expect.soft(f.disk().get(f.sourceKey)).toEqual(source);
+    expect(f.form.view().wipe?.ver, 'the owner must see the new marker').toBe(versionOf(wipe));
+
+    await finishMutations(f, f.form.resolveWipe('keep'));
+    expect(f.disk().get(f.sourceKey)).toEqual(source);
+    expect(await f.drafts.readWipeVersion()).toBe(versionOf(wipe));
+    const moving = f.restore();
+    const destination = await vi.waitFor(f.mutation);
+    expect(destination.pendingKeys).toEqual([f.destinationKey]);
+    destination.succeedRequest();
+    expect(f.disk().get(f.sourceKey)).toEqual(source);
+    expect(f.disk().get(f.destinationKey)).toBeUndefined();
+    destination.complete();
+    await finishMutations(f, moving);
+    expect(f.form.view()).toMatchObject({ key: f.destinationKey, wipe: undefined });
+    expect(f.disk().has(f.destinationKey)).toBe(true);
+    expect(f.disk().has(f.sourceKey)).toBe(false);
+    expect(f.host.committed().entries[f.sourceKey]).toBe(f.tombstone.value);
+    expect(f.host.api.persistDataSynced).not.toHaveBeenCalled();
+
+    await f.form.save();
+    expect(f.host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(
+      expect.any(String),
+      f.destinationKey,
+    );
+    const [value] = f.host.api.persistDataSynced.mock.lastCall!;
+    expect(decodeRecord(f.destinationKey, value)).toMatchObject({
+      ok: true,
+      value: { projectKey: to, krKey, cadence: 'Weekly' },
+    });
+  },
+);
+
+it('leaves both draft keys untouched if the destination read finds an unknown schema', async () => {
+  const f = await fixture();
+  const load = f.host.api.loadSyncedData.getMockImplementation()!;
+  let sourceChecked = false;
+  f.host.api.loadSyncedData.mockImplementation(async (key) => {
+    const value = await load(key);
+    if (key !== WIPE_KEY) return value;
+    if (sourceChecked) return '{"v":99}';
+    sourceChecked = true;
+    return value;
+  });
+  const mutations = f.database.mutations.length;
+  await finishMutations(f, f.restore());
+  expect(f.host.api.loadSyncedData).toHaveBeenCalledWith(f.destinationKey);
+  expect(f.form.view().key).toBe(f.sourceKey);
+  expect(f.database.mutations).toHaveLength(mutations);
+  expect(f.disk().get(f.sourceKey)).toEqual(source);
+  expect(f.disk().get(f.destinationKey)).toBeUndefined();
+  expect(f.host.api.persistDataSynced).not.toHaveBeenCalled();
+});

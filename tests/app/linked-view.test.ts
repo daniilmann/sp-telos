@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { App } from '../../src/ui/App';
 import type { Command, CompatibilityQuery } from '../../src/app/commands';
 import { buildPlan } from '../../src/core/plan';
+import { WIPE_KEY } from '../../src/core/records';
 import { createDraftStore } from '../../src/platform/draft-store';
 import { linkedRecordKey } from '../../src/platform/linked-record-keys';
 import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
@@ -16,6 +17,7 @@ import {
   goalWrite,
   startLinkedHost,
   versionOf,
+  type FakeHost,
 } from '../fakes/fake-facade';
 
 type Properties = Record<string, unknown>;
@@ -110,7 +112,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function fixture(entries: Record<string, string>, draft?: typeof local) {
+async function fixture(
+  entries: Record<string, string>,
+  draft?: typeof local,
+  beforeView?: (host: FakeHost) => void,
+) {
   const host = createFakeHost({ entries });
   const hooks = new Map<PluginHooks, PluginHookHandler>();
   const api = {
@@ -164,6 +170,7 @@ async function fixture(entries: Record<string, string>, draft?: typeof local) {
       listener = callback;
     },
   });
+  beforeView?.(host);
   await import('../../src/ui');
   preact.render();
   const stop = preact.runEffect();
@@ -333,4 +340,71 @@ it('Enter read-only at startup, ignore a stale block and recheck before each pla
   expect(f.view().view.readOnly).toBe(true);
   expect(f.commands('apply')).toHaveLength(0);
   expect(f.disk()).toEqual(local);
+});
+
+it('keeps the newer version, write mode and wipe when opening replies late', async () => {
+  const fresh = goalWrite(1, 21);
+  const draft = { ...local, baseVer: versionOf(fresh) };
+  const f = await fixture({ [goal.key]: goal.value, [other.key]: unknownVersion }, draft);
+  const opening = f.holdCompatibility();
+  f.click('Цель 11');
+  await opening.received.promise;
+  await settle();
+  expect(f.view().view.ready).toBeFalsy();
+
+  const wipe = buildPlan('manual', [{ key: WIPE_KEY, base: 'absent', record: {} }], {
+    at,
+    newId: () => versionOf(other),
+  }).writes[0]!;
+  f.host.receiveImport({ [fresh.key]: fresh.value, [WIPE_KEY]: wipe.value });
+  await f.signal(PluginHooks.DATA_CHANGED);
+  await vi.waitFor(() => {
+    expect(f.view().records[goal.key]).toMatchObject({ ver: versionOf(fresh) });
+  });
+  opening.release.resolve();
+  await settle();
+  await vi.waitFor(() => {
+    expect(f.view().view.ready).toBe(true);
+  });
+  expect.soft(f.view().view.readOnly).toBe(false);
+  expect.soft(f.view().view.record).toMatchObject({ ver: versionOf(fresh), statement: 'Цель 21' });
+  expect.soft(f.view().view.wipe?.ver).toBe(versionOf(wipe));
+  expect(f.disk()).toEqual(draft);
+  expect(f.commands('apply')).toHaveLength(0);
+});
+
+it('retries a timed-out initial enumeration and keeps writes disabled until recovery', async () => {
+  const healthy = createDeferred();
+  const recover = vi.fn();
+  const f = await fixture({ [goal.key]: goal.value }, undefined, (host) => {
+    const list = host.api.listSyncedDataKeys.getMockImplementation()!;
+    let attempt = 0;
+    host.api.listSyncedDataKeys.mockImplementation(async (prefix) => {
+      if (prefix === 'initiative:') {
+        attempt += 1;
+        if (attempt === 1) throw new Error('API call timeout');
+        // The host compatibility check runs separately from the initial iframe read.
+        if (attempt > 2) {
+          recover();
+          await healthy.promise;
+        }
+      }
+      return list(prefix);
+    });
+  });
+  const blocked = /Не удалось перечислить ключи для проверки схемы/;
+  expect(f.text()).toMatch(blocked);
+  expect(f.button('Создать')?.props.disabled).toBe(true);
+  for (let elapsed = 0; elapsed < 30_000 && recover.mock.calls.length === 0; elapsed += 500) {
+    await vi.advanceTimersByTimeAsync(500);
+  }
+  expect.soft(recover, 'automatic enumeration after API call timeout').toHaveBeenCalled();
+  expect(f.text()).toMatch(blocked);
+  expect(f.button('Создать')?.props.disabled).toBe(true);
+  expect(f.commands('apply')).toHaveLength(0);
+
+  healthy.resolve();
+  await settle();
+  expect.soft(f.text()).not.toMatch(blocked);
+  expect(f.button('Создать')?.props.disabled).toBe(false);
 });

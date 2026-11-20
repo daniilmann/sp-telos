@@ -288,6 +288,20 @@ describe('Reject unavailable new links at direct apply', () => {
     await expect(run.apply(plan)).resolves.toMatchObject({ transferred: 0 });
     expect(host.api.persistDataSynced).not.toHaveBeenCalled();
   });
+
+  it('skips an exact replay and preserves untouched links when the same plan removes their KR', async () => {
+    const host = linkedHost(kr, taskCreation, initiativeCreation);
+    const run = await startLinkedHost(host);
+    const tombstone = write(kr.key, deleted, 44, versionOf(kr));
+    const sphereEdit = editTask({ sphereTagKey: 'tag:Sphere' }, 45);
+
+    await expect(
+      run.apply(manualPlan(tombstone, initiativeCreation, sphereEdit)),
+    ).resolves.toMatchObject({
+      transferred: 2,
+    });
+    expect(host.api.persistDataSynced.mock.calls).toEqual(handoffs(tombstone, sphereEdit));
+  });
 });
 
 describe('Replay a plan with its original version', () => {
