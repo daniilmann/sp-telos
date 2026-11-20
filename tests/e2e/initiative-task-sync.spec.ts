@@ -48,7 +48,7 @@ import {
 } from './initiative-task.fixtures';
 import { expect, test, type StandProfile } from './stand';
 
-type NativeAction = 'HA' | 'HD' | 'HRD';
+type NativeAction = 'HA' | 'HD' | 'HR';
 
 function readNativeOperation({ taskId, action }: { taskId: string; action: NativeAction }) {
   return new Promise<{ id: string; clientId: string } | undefined>((resolve, reject) => {
@@ -199,7 +199,7 @@ test('Resolve either delivery order and return of the original ID', async ({ sta
 
   await test.step('Restore the deleted original ID and deliver the native operation alone', async () => {
     await restoreDeletedTask(stand, a, taskLater, taskLaterTitle);
-    await deliver(await nativeOperation(a, taskLater, 'HRD'));
+    await deliver(await nativeOperation(a, taskLater, 'HR'));
     await expect
       .poll(() => findTask(b, taskLater))
       .toMatchObject({ id: taskLater, title: taskLaterTitle });
