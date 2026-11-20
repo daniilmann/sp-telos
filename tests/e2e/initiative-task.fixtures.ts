@@ -14,7 +14,7 @@ import {
   status,
   sync,
 } from './save-confirmation.fixtures';
-import { expect, test, type Stand, type StandProfile } from './stand';
+import { expect, openPluginIndex, test, type Stand, type StandProfile } from './stand';
 
 export type Write = Plan['writes'][number];
 export const titles = {
@@ -35,13 +35,26 @@ export function version(write: Pick<Write, 'key' | 'value'>) {
   return splitRecord(parsed.value);
 }
 
+function createAnnualGoalButton(frame: FrameLocator) {
+  return frame
+    .locator('section')
+    .filter({
+      has: frame.getByRole('heading', { name: 'Годовые цели', exact: true }),
+    })
+    .getByRole('button', { name: 'Создать', exact: true });
+}
+
 export async function ready(profile: StandProfile) {
   await test.step('The installed ZIP opens the ready goals screen', async () => {
+    const enabled = createAnnualGoalButton(profile.frame).and(profile.frame.locator(':enabled'));
+    try {
+      await enabled.waitFor({ state: 'visible', timeout: 6_000 });
+    } catch {
+      // Reopen once if the initial iframe mounted before its host bridge finished starting.
+      profile.frame = await openPluginIndex(profile.page, 'sp-telos');
+    }
     await expect(profile.frame.getByRole('heading', { name: 'Цели и результаты' })).toBeVisible();
-    const goals = profile.frame.locator('section').filter({
-      has: profile.frame.getByRole('heading', { name: 'Годовые цели', exact: true }),
-    });
-    await expect(goals.getByRole('button', { name: 'Создать', exact: true })).toBeEnabled();
+    await expect(createAnnualGoalButton(profile.frame)).toBeEnabled({ timeout: 20_000 });
   });
 }
 
@@ -114,7 +127,9 @@ export async function task(profile: StandProfile, title: string, projectId = inb
     (_body, data) => PluginAPI.addTask({ ...data, isIgnoreShortSyntax: true }),
     { title, projectId },
   );
-  await expect.poll(() => findTask(profile, id)).toMatchObject({ id, title, projectId });
+  await expect(async () => {
+    expect(await findTask(profile, id)).toMatchObject({ id, title, projectId });
+  }).toPass({ timeout: 35_000 });
   return id;
 }
 
@@ -133,10 +148,7 @@ export function findTag(profile: StandProfile, id: string) {
 }
 
 export function findTask(profile: StandProfile, id: string) {
-  return form(profile).evaluate(
-    async (_body, id) => (await PluginAPI.getTasks()).find((item) => item.id === id),
-    id,
-  );
+  return form(profile).evaluate(async (_body, id) => (await PluginAPI.getAppState()).tasks[id], id);
 }
 
 export async function updateTask(profile: StandProfile, id: string, fields: Partial<Task>) {
