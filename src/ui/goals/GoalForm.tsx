@@ -12,6 +12,7 @@ export type GoalRecords = Readonly<Record<string, GoalRecord | undefined>>;
 
 export interface FormProps {
   readonly draftActions?: ComponentChildren;
+  readonly measurements?: ComponentChildren;
   readonly view: View;
   readonly spheres?: ReferenceOptions;
   readonly records: GoalRecords;
@@ -241,6 +242,7 @@ export function GoalForm(props: Readonly<FormProps>) {
       )}
       {props.draftActions}
       {view.ready && <GoalFieldsForm {...props} kind={kind} record={record} />}
+      {record?.kind === 'kr' && props.measurements}
     </section>
   );
 }

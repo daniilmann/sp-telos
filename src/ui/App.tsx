@@ -1,14 +1,21 @@
 import { linkedKind } from '../app/linked-editor-intent';
 import type { GoalEditor } from '../app/goal-editor';
+import type { KrValueEditor, listKrValueDrafts } from '../app/kr-values';
 import type { GoalRecord } from '../core/goals';
 import type { LinkedReferences } from '../app/initiative-task-links';
 import { LinkForm, LinkLists } from './links/LinkForms';
 import { ReferenceChoices, type ReferenceOptions } from './links/ReferencePicker';
 import { GoalForm, kindLabels, type FormProps, type GoalRecords } from './goals/GoalForm';
+import { KrValues } from './goals/KrValues';
 
 interface AppProps {
   readonly editor: GoalEditor;
   readonly view: ReturnType<GoalEditor['view']>;
+  readonly measurements: KrValueEditor;
+  readonly measurementView: ReturnType<KrValueEditor['view']>;
+  readonly measurementDrafts: Awaited<ReturnType<typeof listKrValueDrafts>>;
+  readonly openMeasurement: (key: string, krKey: string) => void;
+  readonly resolveWipe: (choice: Parameters<GoalEditor['resolveWipe']>[0]) => void;
   readonly records: GoalRecords;
   readonly links: LinkedReferences;
   readonly refresh: () => void;
@@ -25,6 +32,11 @@ interface AppProps {
 export function App({
   editor,
   view,
+  measurements,
+  measurementView,
+  measurementDrafts,
+  openMeasurement,
+  resolveWipe,
   records,
   links,
   refresh,
@@ -45,9 +57,12 @@ export function App({
     retryDraft: () => void editor.retryDraftRemoval(),
     resolveDraft: (choice: Parameters<GoalEditor['resolveDraft']>[0], target?: string) =>
       void editor.resolveDraft(choice, target),
-    resolveWipe: (choice: Parameters<GoalEditor['resolveWipe']>[0]) =>
-      void editor.resolveWipe(choice),
+    resolveWipe,
   };
+  const measurementCard =
+    measurementView.key === view.key && measurementView.ready ? (
+      <KrValues editor={measurements} view={measurementView} />
+    ) : undefined;
   const form = {
     view,
     input: editor.input,
@@ -58,11 +73,29 @@ export function App({
       <DraftActions {...draftActions} moveOptions={kind ? restoreOptions : undefined} />
     ),
   };
-  const openForm = kind ? (
-    <LinkForm {...form} links={links} />
+  const standaloneMeasurement =
+    measurementCard && !measurementView.live && measurementView.draftKey;
+  const goalForm = standaloneMeasurement ? (
+    <section class="stack">
+      <header class="page-header">
+        <h2>Черновик измерения</h2>
+        <button
+          type="button"
+          class="btn-text"
+          onClick={() => {
+            back();
+          }}
+        >
+          К списку
+        </button>
+      </header>
+      {form.draftActions}
+      {measurementCard}
+    </section>
   ) : (
-    <GoalForm {...form} records={records} spheres={links.tags} />
+    <GoalForm {...form} records={records} spheres={links.tags} measurements={measurementCard} />
   );
+  const selectedForm = kind ? <LinkForm {...form} links={links} /> : goalForm;
   return (
     <main class="page stack" lang="ru">
       <header class="page-header">
@@ -74,7 +107,7 @@ export function App({
       {message && <p role="status">{message}</p>}
       {readOnly && readOnly !== view.message && <p class="callout callout--warning">{readOnly}</p>}
       {view.key ? (
-        openForm
+        selectedForm
       ) : (
         <div class="stack">
           {Object.entries(kindLabels).map(([kind, label]) => {
@@ -131,6 +164,37 @@ export function App({
               </section>
             );
           })}
+          {measurementDrafts.length > 0 && (
+            <section class="stack">
+              <h2>Несохранённые измерения</h2>
+              <ul class="list">
+                {measurementDrafts.map(({ key, krKey, value }) => (
+                  <li class="list-item" key={key}>
+                    <button
+                      type="button"
+                      class="btn-text"
+                      onClick={() => {
+                        openMeasurement(key, krKey);
+                      }}
+                    >
+                      {records[krKey]?.statement
+                        ? `Черновик измерения — ${records[krKey].statement}`
+                        : 'Открыть черновик измерения'}
+                    </button>
+                    {!records[krKey] && (
+                      <span class="text-muted">Ключевой результат недоступен</span>
+                    )}
+                    {value && (
+                      <span class="text-muted">
+                        {value.slice(0, 80)}
+                        {value.length > 80 && '…'}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
           <LinkLists {...{ links, open, openSource, discard }} />
         </div>
       )}

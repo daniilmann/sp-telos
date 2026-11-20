@@ -56,6 +56,7 @@ export function createGoalEditor({
   const lastHandoffByKey = new Map<string, number>();
   let dirty = false;
   let navigation = 0;
+  let failedLeaveKeys: readonly string[] = [];
   const reads = createEditorReads(
     drafts,
     () => ({ id: formId, view, dirty: dirty && !confirmedInput }),
@@ -369,7 +370,7 @@ export function createGoalEditor({
     update(afterWipe(view, Boolean(handled), discard, ver));
   }
 
-  async function leave(choice?: LeaveChoice): Promise<boolean> {
+  async function leave(choice?: LeaveChoice, measurementDraftKey?: string): Promise<boolean> {
     if (choice === 'stay') {
       update({ leaveChoices: undefined });
       return false;
@@ -377,12 +378,15 @@ export function createGoalEditor({
     const { key } = view;
     const id = formId;
     if (choice === 'discard') {
-      drafts.remove(key);
+      if (!measurementDraftKey || failedLeaveKeys.includes(key)) drafts.remove(key);
+      if (measurementDraftKey && failedLeaveKeys.includes(measurementDraftKey))
+        drafts.remove(measurementDraftKey);
       close();
       return true;
     }
     const result = await drafts.flush();
     if (id !== formId) return false;
+    failedLeaveKeys = result.ok ? [] : result.keys;
     if (result.ok) close();
     else update(leaveFailed);
     return result.ok;
