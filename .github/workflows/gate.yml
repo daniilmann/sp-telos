@@ -385,6 +385,19 @@ jobs:
                   "Import revokes confirmation for identical data",
                   "A newer draft intent arrives during deletion",
                   "A newer draft intent arrives during deletion (the deletion aborts)"
+                ],
+                "initiative-task-links.spec.ts": [
+                  "Mark a project and reopen the same initiative",
+                  "Move a task or change its initiative without rewriting direct KR",
+                  "Resolve renamed base objects by their original IDs"
+                ],
+                "initiative-task-sync.spec.ts": [
+                  "Resolve either delivery order and return of the original ID",
+                  "Converge concurrent changes by whole key",
+                  "Confirm on the writer and read independently on a second client"
+                ],
+                "initiative-task-backup.spec.ts": [
+                  "Import a full synthetic backup in an isolated profile"
                 ]
               }
               | to_entries | map(.key as $file | .value[] | [$file, [.]]) | sort;
