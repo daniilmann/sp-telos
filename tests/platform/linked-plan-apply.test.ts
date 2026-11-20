@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildPlan, classifyPlan, type Plan } from '../../src/core/plan';
-import type { RecordInput, TaskMeta } from '../../src/core/records';
-import { createHostFacade } from '../../src/platform/facade';
+import { canonicalJson, WIPE_KEY, type RecordInput, type TaskMeta } from '../../src/core/records';
+import { createHostFacade, readRecords } from '../../src/platform/facade';
+import { apply } from '../../src/platform/sp-facade';
 import {
   baseAppState,
   baseProject,
@@ -75,6 +76,56 @@ function linkedHost(...initial: Write[]) {
 const handoffs = (...writes: Write[]) => writes.map(({ value, key }) => [value, key]);
 const staleReason = /stale|устар/i;
 
+describe('Apply a measurement', () => {
+  const key = 'kr-value:20000000-0000-4000-8000-000000000004';
+  const ver = '20000000-0000-4000-8000-000000000051';
+  const value = canonicalJson({ v: 2, ver, at: 51, kind: 'kr-value', krKey, value: '5 дней' });
+  const plan = manualPlan({ key, base: 'absent', value });
+  const parent = write(
+    krKey,
+    { ...priorKr, status: 'closed', outcome: 'achieved', closureReason: 'Done' },
+    52,
+  );
+  const guard = { expectedWipe: 'absent', byteCheck: 'allow-absent', forceSync: true } as const;
+
+  it('writes beside a closed KR, reading the exact fact before and after enumeration', async () => {
+    const host = linkedHost(parent);
+    vi.stubGlobal('PluginAPI', host.api);
+    await expect(apply(plan, guard)).resolves.toMatchObject({ transferred: 1 });
+    const entries = { [krKey]: parent.value, [key]: value };
+    expect((await readRecords([key])).entries).toEqual(entries);
+    await host.commitAfter(Promise.resolve());
+    expect((await readRecords()).entries).toEqual(entries);
+    expect(host.committed().entries).toEqual(entries);
+    const replay = { ...guard, byteCheck: 'require-exact' } as const;
+    await expect(apply(plan, replay)).resolves.toMatchObject({ transferred: 0 });
+    expect(host.api.persistDataSynced).toHaveBeenCalledExactlyOnceWith(value, key);
+  });
+
+  it.each([
+    ['missing parent', [], undefined],
+    ['deleted parent', [write(krKey, deleted, 53)], undefined],
+    ['wipe read error', [parent], new Error('Read failed')],
+    ['damaged wipe', [parent], '{'],
+    ['missing observed bytes', [parent], undefined],
+  ] as const)('rejects %s without write or sync', async (failure, parents, wipe) => {
+    const host = linkedHost(...parents);
+    vi.stubGlobal('PluginAPI', host.api);
+    if (typeof wipe === 'string') host.receiveSync(WIPE_KEY, wipe);
+    if (wipe instanceof Error) {
+      const load = host.api.loadSyncedData.getMockImplementation()!;
+      host.api.loadSyncedData.mockImplementation((key) =>
+        key === WIPE_KEY ? Promise.reject(wipe) : load(key),
+      );
+    }
+    const byteCheck = failure === 'missing observed bytes' ? 'require-exact' : guard.byteCheck;
+    const options = { ...guard, byteCheck } as const;
+    await expect.soft(apply(plan, options)).rejects.toThrow();
+    expect(host.api.persistDataSynced).not.toHaveBeenCalled();
+    expect(host.api.triggerSync).not.toHaveBeenCalled();
+  });
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -124,9 +175,8 @@ describe('Reject a mismatched canonical key or source reference', () => {
   it.each(cases)('allows a separate edit beside a corrupt $name', async ({ forged }) => {
     const host = linkedHost(kr, forged);
     const run = await startLinkedHost(host);
-    const read = await createHostFacade().read();
-    expect.soft(read.entries).not.toHaveProperty(forged.key);
-    expect.soft(read.readOnlyReason).toBeUndefined();
+    const entries = { [kr.key]: kr.value };
+    expect(await readRecords()).toEqual({ entries, unreadKeys: [forged.key] });
     await expect(run.apply(manualPlan(neighbor))).resolves.toMatchObject({ transferred: 1 });
     expect(host.api.persistDataSynced.mock.calls).toEqual(handoffs(neighbor));
   });
@@ -160,15 +210,17 @@ describe('Reject unavailable new links at direct apply', () => {
   const missingSphere = { sphereTagKey: 'tag:Missing' } as const;
   const initial = [kr, taskCreation, annual];
   const absentKrLinks = [
-    {
-      name: 'initiative KR',
-      target: write(initiativeKey, { ...initiative, krKey: otherKrKey }, 31),
-    },
-    {
-      name: 'direct KR added to a nonempty set',
-      target: editTask({ directKrKeys: [krKey, otherKrKey] }, 32),
-    },
-  ];
+    ['initiative KR', write(initiativeKey, { ...initiative, krKey: otherKrKey }, 31)],
+    ['direct KR added to a nonempty set', editTask({ directKrKeys: [krKey, otherKrKey] }, 32)],
+  ] as const;
+  const annualBody = { ...goalBody, ...missingSphere, kind: 'annual-goal' } as const;
+  const objectiveBody = {
+    ...goalBody,
+    ...missingSphere,
+    kind: 'objective',
+    quarter: '2026-Q4',
+    annualGoalKey: annual.key,
+  } as const;
   const unavailable: readonly {
     name: string;
     target: Write;
@@ -180,34 +232,14 @@ describe('Reject unavailable new links at direct apply', () => {
     { name: 'the source task at creation', target: taskCreation, removeTask: true },
     {
       name: 'a sphere tag on an annual goal',
-      target: write(
-        annual.key,
-        { ...goalBody, ...missingSphere, kind: 'annual-goal' },
-        34,
-        versionOf(annual),
-      ),
+      target: write(annual.key, annualBody, 34, versionOf(annual)),
     },
-    {
-      name: 'a sphere tag on an objective',
-      target: write(
-        objectiveKey,
-        {
-          kind: 'objective',
-          ...goalBody,
-          ...missingSphere,
-          quarter: '2026-Q4',
-          annualGoalKey: annual.key,
-        },
-        35,
-      ),
-    },
+    { name: 'a sphere tag on an objective', target: write(objectiveKey, objectiveBody, 35) },
     { name: 'a sphere tag on task metadata', target: editTask(missingSphere, 36) },
-    ...absentKrLinks.map(({ name, target }) => ({ name: `missing ${name}`, target })),
-    ...absentKrLinks.map(({ name, target }) => ({
-      name: `deleted ${name}`,
-      target,
-      tombstone: write(otherKrKey, deleted, 37),
-    })),
+    ...absentKrLinks.flatMap(([name, target]) => [
+      { name: `missing ${name}`, target },
+      { name: `deleted ${name}`, target, tombstone: write(otherKrKey, deleted, 37) },
+    ]),
     ...(['missing', 'deleted'] as const).map((state) => ({
       name: `${state} initiative on task metadata`,
       target: editTask({ initiativeKey }, 38),
@@ -225,7 +257,6 @@ describe('Reject unavailable new links at direct apply', () => {
     const original = host.committed();
     const plan = manualPlan(neighbor, test.target);
     expect(classifyPlan(original, plan)).toEqual({ ok: true, writes: plan.writes });
-
     await expect.soft(run.apply(plan)).rejects.toThrow();
     expect(host.api.persistDataSynced).not.toHaveBeenCalled();
     expect(host.committed()).toEqual(original);
@@ -295,11 +326,8 @@ describe('Reject unavailable new links at direct apply', () => {
     const tombstone = write(kr.key, deleted, 44, versionOf(kr));
     const sphereEdit = editTask({ sphereTagKey: 'tag:Sphere' }, 45);
 
-    await expect(
-      run.apply(manualPlan(tombstone, initiativeCreation, sphereEdit)),
-    ).resolves.toMatchObject({
-      transferred: 2,
-    });
+    const plan = manualPlan(tombstone, initiativeCreation, sphereEdit);
+    await expect(run.apply(plan)).resolves.toMatchObject({ transferred: 2 });
     expect(host.api.persistDataSynced.mock.calls).toEqual(handoffs(tombstone, sphereEdit));
   });
 });
@@ -319,25 +347,23 @@ describe('Replay a plan with its original version', () => {
       await refuse.promise;
       throw new Error('Host refused task metadata.');
     });
-    const first = run.apply(plan).catch((error: unknown) => error);
+    const first = run.apply(plan);
+    void first.catch(() => undefined);
     try {
       await Promise.race([entered.promise, first]);
-      expect(host.api.persistDataSynced.mock.calls).toEqual(
-        handoffs(initiativeCreation, taskCreation),
-      );
+      const attempted = handoffs(initiativeCreation, taskCreation);
+      expect(host.api.persistDataSynced.mock.calls).toEqual(attempted);
     } finally {
       refuse.resolve();
     }
-    expect(await first).toMatchObject({ message: expect.stringMatching(/1\s*(?:of|из|\/)\s*2/i) });
-    const visible = await createHostFacade().read([initiativeKey]);
+    await expect(first).rejects.toThrow(/1\s*(?:of|из|\/)\s*2/i);
+    const visible = await readRecords([initiativeKey]);
     expect(visible.entries[initiativeKey]).toBe(initiativeCreation.value);
     host.beforeHandoff.mockResolvedValue(undefined);
     host.api.persistDataSynced.mockClear();
 
     await expect(run.apply(plan)).resolves.toMatchObject({ transferred: 1, writes: plan.writes });
     expect(host.api.persistDataSynced.mock.calls).toEqual(handoffs(taskCreation));
-    const [value] = host.api.persistDataSynced.mock.calls[0]!;
-    expect(versionOf({ ...taskCreation, value })).toBe(versionOf(taskCreation));
     host.api.persistDataSynced.mockClear();
     await expect(run.apply(plan)).resolves.toMatchObject({ transferred: 0 });
     expect(host.api.persistDataSynced).not.toHaveBeenCalled();

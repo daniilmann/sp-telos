@@ -1,7 +1,14 @@
+import { Buffer } from 'node:buffer';
 import { assert, describe, expect, it } from 'vitest';
-import type { GoalRecord } from '../../src/core/goals';
+import { reviseKr, type GoalRecord } from '../../src/core/goals';
 import { applyPlan, buildPlan, classifyPlan, MODEL_VERSION } from '../../src/core/plan';
-import { canonicalJson, decodeRecord, splitRecord, WIPE_KEY } from '../../src/core/records';
+import {
+  canonicalJson,
+  decodeRecord,
+  MAX_RECORD_BYTES,
+  splitRecord,
+  WIPE_KEY,
+} from '../../src/core/records';
 
 const annualGoalKey = 'annual-goal:00000000-0000-4000-8000-000000000001';
 const objectiveKey = 'objective:00000000-0000-4000-8000-000000000002';
@@ -46,6 +53,73 @@ const records: ReadonlyArray<readonly [string, GoalRecord | { readonly deleted: 
   [krKey, kr],
   [krKey, { deleted: true }],
 ];
+
+describe('KR measurement records', () => {
+  const key = 'kr-value:00000000-0000-4000-8000-000000000009';
+  const record = { v: 2, ver, at, kind: 'kr-value', krKey, value: '0' };
+
+  it('decodes a measurement and its tombstone under a separate key', () => {
+    const tombstone = { v: 2, ver, at, deleted: true };
+    expect.soft(decodeRecord(key, canonicalJson(record))).toEqual({ ok: true, value: record });
+    expect(decodeRecord(key, canonicalJson(tombstone))).toEqual({ ok: true, value: tombstone });
+  });
+
+  it.each([
+    { v: 1 },
+    { value: '' },
+    { value: ' \t' },
+    { value: 0 },
+    { krKey: objectiveKey },
+    { extra: true },
+  ])('rejects a measurement with %j', (fields) => {
+    expect(decodeRecord(key, canonicalJson({ ...record, ...fields }))).toEqual({
+      ok: false,
+      reason: 'invalid',
+    });
+  });
+
+  it('reports an unknown measurement schema', () => {
+    expect(decodeRecord(key, canonicalJson({ ...record, v: 3 }))).toEqual({
+      ok: false,
+      reason: 'unsupported-version',
+    });
+  });
+
+  it('counts the entire measurement in UTF-8 at the storage boundary', () => {
+    const remaining = MAX_RECORD_BYTES - Buffer.byteLength(canonicalJson({ ...record, value: '' }));
+    const value = 'я'.repeat(Math.floor(remaining / 2)) + 'x'.repeat(remaining % 2);
+    const exact = canonicalJson({ ...record, value });
+    const overflow = canonicalJson({ ...record, value: value + 'x' });
+    expect(Buffer.byteLength(exact)).toBe(MAX_RECORD_BYTES);
+    expect(Buffer.byteLength(overflow)).toBe(MAX_RECORD_BYTES + 1);
+    expect.soft(decodeRecord(key, exact).ok).toBe(true);
+    expect(decodeRecord(key, overflow)).toEqual({ ok: false, reason: 'size' });
+  });
+});
+
+it('retains the previous closed KR and its history when a revision would overflow', () => {
+  const snapshot = kr.history[0];
+  const stored = { ...kr, v: 2, ver, at };
+  const padding = MAX_RECORD_BYTES - Buffer.byteLength(canonicalJson(stored)) - 32;
+  const history = [
+    { ...snapshot, revisionReason: snapshot.revisionReason + 'я'.repeat(Math.floor(padding / 2)) },
+  ];
+  const current = { ...kr, history };
+  const raw = canonicalJson({ ...stored, history });
+  const state = { entries: { [krKey]: raw } };
+  const revised = reviseKr(current, { ...kr, target: '6 минут' }, 'New sampling method');
+  assert(revised.ok);
+  const newVer = '10000000-0000-4000-8000-000000000002';
+  const plan = buildPlan('kr-revision', [{ key: krKey, base: ver, record: revised.value }], {
+    at,
+    newId: () => newVer,
+  });
+
+  expect(Buffer.byteLength(raw)).toBeLessThan(MAX_RECORD_BYTES);
+  expect(Buffer.byteLength(plan.writes[0]!.value)).toBeGreaterThan(MAX_RECORD_BYTES);
+  expect(classifyPlan(state, plan)).toEqual({ ok: false, reason: 'size' });
+  expect(applyPlan(state, plan)).toEqual({ entries: { [krKey]: raw } });
+});
 
 describe('round-trips each record with a child-to-parent key', () => {
   it.each(records)('writes and reads %s with %j', (key, record) => {
