@@ -198,40 +198,43 @@ export async function openPluginPanel(profile: StandProfile): Promise<StandProfi
   return { ...profile, frame };
 }
 
-export async function exportAndImport(page: Page): Promise<void> {
+async function openImportExport(page: Page): Promise<Locator> {
   const timeout = 8_000;
   const tab = page.locator('mat-tab-header .mat-mdc-tab:has(mat-icon:has-text("cloud_sync"))');
   const panel = page.locator('collapsible').filter({ hasText: 'Import/Export' });
-  const imex = panel.locator('file-imex');
-  await base.step('Select the Sync & Backup settings tab', async () => {
-    await tab.click({ timeout });
-    await expect(tab).toHaveAttribute('aria-selected', 'true', { timeout });
-  });
-  await base.step('Expand Import/Export and wait for its controls', async () => {
+  await tab.click({ timeout });
+  await expect(tab).toHaveAttribute('aria-selected', 'true', { timeout });
+  if (!(await panel.locator('file-imex').isVisible()))
     await panel.locator('.collapsible-header, .header').click({ timeout });
-    await expect(panel.locator('.collapsible-panel:not(.ng-animating)')).toBeVisible({ timeout });
-  });
-  const backup = await base.step(
-    'Download the real backup',
-    async () => {
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout }),
-        imex.locator('button:has(mat-icon:text-is("file_upload"))').click({ timeout }),
-      ]);
-      return download.path();
-    },
-    { timeout: 12_000 },
-  );
-  await base.step('Import that file and handle the encryption warning if shown', async () => {
-    const warning = page.locator('dialog-import-encryption-warning');
-    const today = /#\/tag\/TODAY\//;
-    await imex.locator('input[type="file"]').setInputFiles(backup, { timeout });
-    await expect
-      .poll(async () => today.test(page.url()) || (await warning.isVisible()), { timeout })
-      .toBe(true);
-    if (await warning.isVisible()) await warning.locator('button[color="warn"]').click({ timeout });
-    await expect(page).toHaveURL(today, { timeout });
-  });
+  await expect(panel.locator('.collapsible-panel:not(.ng-animating)')).toBeVisible({ timeout });
+  return panel.locator('file-imex');
+}
+
+export async function exportBackup(page: Page): Promise<string> {
+  const timeout = 8_000;
+  const imex = await openImportExport(page);
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout }),
+    imex.locator('button:has(mat-icon:text-is("file_upload"))').click({ timeout }),
+  ]);
+  return download.path();
+}
+
+export async function importBackup(page: Page, backup: Parameters<Locator['setInputFiles']>[0]) {
+  const timeout = 8_000;
+  const imex = await openImportExport(page);
+  const warning = page.locator('dialog-import-encryption-warning');
+  const today = /#\/tag\/TODAY\//;
+  await imex.locator('input[type="file"]').setInputFiles(backup, { timeout });
+  await expect
+    .poll(async () => today.test(page.url()) || (await warning.isVisible()), { timeout })
+    .toBe(true);
+  if (await warning.isVisible()) await warning.locator('button[color="warn"]').click({ timeout });
+  await expect(page).toHaveURL(today, { timeout });
+}
+
+export async function exportAndImport(page: Page): Promise<void> {
+  await importBackup(page, await exportBackup(page));
 }
 
 async function installPlugin(page: Page, zip: string): Promise<void> {
