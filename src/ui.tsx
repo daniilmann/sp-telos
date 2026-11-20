@@ -31,12 +31,23 @@ interface ViewActions {
   readonly discard: (key: string) => void;
 }
 
+const emptyLinks: LinkedReferences = {
+  projects: {},
+  tasks: {},
+  tags: {},
+  krs: {},
+  initiatives: {},
+  initiativeRows: [],
+  taskRows: [],
+  live: new Set(),
+};
+
 function View() {
   const [data, setData] = useState<{
     snapshot: ReadSnapshot;
-    links: LinkedReferences;
     draftKeys: readonly string[];
   }>();
+  const [links, setLinks] = useState(emptyLinks);
   const [message, setMessage] = useState('Загрузка…');
   const [model, setModel] = useState<{
     editor: GoalEditor;
@@ -88,20 +99,30 @@ function View() {
     async function publish(snapshot: ReadSnapshot, updateOpen = false) {
       const stamp = stamps.get(snapshot) ?? 0;
       const latest = () => active && stamp >= displayed;
-      const [references, listed] = await Promise.all([host.readBaseReferences(), drafts.list()]);
-      const links = await resolveLinkedReferences(snapshot, references, listed.keys, (key) =>
-        drafts.read(key),
-      );
+      const listed = await drafts.list();
       if (!latest()) return;
       displayed = stamp;
-      setData({
-        snapshot,
-        links,
-        draftKeys: listed.keys,
-      });
+      setData({ snapshot, draftKeys: listed.keys });
       setMessage(listed.failed ? 'Не удалось прочитать список черновиков.' : '');
+      void publishReferences(snapshot, listed.keys, latest);
       if (updateOpen) await editor.refresh(snapshot, latest);
       return listed.keys;
+    }
+
+    async function publishReferences(
+      snapshot: ReadSnapshot,
+      draftKeys: readonly string[],
+      latest: () => boolean,
+    ) {
+      try {
+        const references = await host.readBaseReferences();
+        const linked = await resolveLinkedReferences(snapshot, references, draftKeys, (key) =>
+          drafts.read(key),
+        );
+        if (latest()) setLinks(linked);
+      } catch {
+        if (latest()) setMessage('Не удалось прочитать ссылки.');
+      }
     }
 
     async function load(initial = false) {
@@ -158,7 +179,7 @@ function View() {
     };
   }, []);
 
-  if (!model || !actions || !data) return <p role="status">{message}</p>;
+  if (!model || !actions) return <p role="status">{message}</p>;
   const { editor, view } = model;
   const open = (key: string) => {
     void editor.open(key);
@@ -167,10 +188,10 @@ function View() {
     <App
       editor={editor}
       view={view}
-      records={goalRecords(data.snapshot)}
-      links={data.links}
-      draftKeys={data.draftKeys}
-      readOnly={data.snapshot.readOnlyReason}
+      records={data ? goalRecords(data.snapshot) : {}}
+      links={links}
+      draftKeys={data?.draftKeys ?? []}
+      readOnly={data?.snapshot.readOnlyReason}
       message={message}
       open={open}
       refresh={actions.load}
