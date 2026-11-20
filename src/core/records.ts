@@ -2,10 +2,12 @@ import type { GoalRecord } from './goals';
 
 export const MODEL_VERSION = 2;
 export const MAX_RECORD_BYTES = 256 * 1024;
+export const KR_VALUE_PREFIX = 'kr-value:';
 export const RECORD_PREFIXES = [
   'annual-goal:',
   'objective:',
   'kr:',
+  KR_VALUE_PREFIX,
   'initiative:',
   'task-meta:',
 ] as const;
@@ -18,7 +20,7 @@ const encoder = new TextEncoder();
 
 type Fields = Record<string, unknown>;
 type GoalKind = GoalRecord['kind'];
-type RecordKind = GoalKind | Initiative['kind'] | TaskMeta['kind'];
+type RecordKind = GoalKind | Initiative['kind'] | TaskMeta['kind'] | KrValue['kind'];
 type Tombstone = { readonly deleted: true };
 
 type InitiativeSchedule =
@@ -39,7 +41,19 @@ export interface TaskMeta {
   readonly directKrKeys?: readonly string[];
 }
 
-export type RecordInput = GoalRecord | Initiative | TaskMeta | Tombstone | Record<string, never>;
+export interface KrValue {
+  readonly kind: 'kr-value';
+  readonly krKey: string;
+  readonly value: string;
+}
+
+export type RecordInput =
+  | GoalRecord
+  | Initiative
+  | TaskMeta
+  | KrValue
+  | Tombstone
+  | Record<string, never>;
 
 type ReadVersion = 1 | typeof MODEL_VERSION;
 
@@ -52,7 +66,7 @@ interface RecordVersion<Version extends ReadVersion = ReadVersion> {
 export type StoredGoalRecord = RecordVersion | (RecordVersion & (GoalRecord | Tombstone));
 export type StoredRecord =
   | StoredGoalRecord
-  | (RecordVersion<typeof MODEL_VERSION> & (Initiative | TaskMeta));
+  | (RecordVersion<typeof MODEL_VERSION> & (Initiative | TaskMeta | KrValue));
 type DecodeFailure = 'invalid' | 'size' | 'unsupported-version';
 
 type DecodeResult =
@@ -93,6 +107,7 @@ function kindForKey(key: string): RecordKind | undefined {
     case 'annual-goal':
     case 'objective':
     case 'kr':
+    case 'kr-value':
     case 'initiative':
     case 'task-meta':
       return kind;
@@ -216,19 +231,32 @@ function isTaskMeta(record: Fields): record is Fields & TaskMeta {
   );
 }
 
+function isKrValue(record: Fields): record is Fields & KrValue {
+  return (
+    record.kind === 'kr-value' &&
+    isRecordKeyOfKind(record.krKey, 'kr') &&
+    isNonBlank(record.value) &&
+    hasOnlyFields(record, ['kind', 'krKey', 'value'])
+  );
+}
+
 function decodeBody(
   kind: RecordKind | undefined,
   version: RecordVersion,
   record: Fields,
 ): StoredRecord | undefined {
   if (kind === undefined) return hasOnlyFields(record, []) ? version : undefined;
-  if (version.v === 1 && (kind === 'initiative' || kind === 'task-meta')) return undefined;
+  if (version.v === 1 && (kind === 'initiative' || kind === 'task-meta' || kind === 'kr-value'))
+    return undefined;
   if (record.deleted === true && hasOnlyFields(record, ['deleted'])) {
     return { ...version, deleted: true };
   }
   if (kind === 'initiative' || kind === 'task-meta') {
     const valid = kind === 'initiative' ? isInitiative(record) : isTaskMeta(record);
     return valid ? { ...version, v: MODEL_VERSION, ...record } : undefined;
+  }
+  if (kind === 'kr-value') {
+    return isKrValue(record) ? { ...version, v: MODEL_VERSION, ...record } : undefined;
   }
   return isGoalRecord(record, kind, version.v) ? { ...version, ...record } : undefined;
 }

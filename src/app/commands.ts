@@ -15,9 +15,12 @@ import {
 } from '../core/goals';
 import { buildPlan, classifyPlan, isPlan, type Plan, type PlanState } from '../core/plan';
 import {
+  canonicalJson,
   decodeRecord,
   isObject,
   isUuid,
+  KR_VALUE_PREFIX,
+  MODEL_VERSION,
   splitRecord,
   type RecordInput,
   type StoredGoalRecord,
@@ -29,26 +32,75 @@ import { sourceField, stringField } from './linked-editor-intent';
 
 export const EDIT_INTERVAL_MS = 2000;
 
+export interface KrValuePreconditions {
+  readonly expectedWipe: string;
+  readonly byteCheck: 'allow-absent' | 'require-exact';
+}
+
+export type ApplyOptions = {
+  readonly forceSync?: true;
+  readonly paceEditing?: true;
+} & (KrValuePreconditions | { readonly expectedWipe?: never; readonly byteCheck?: never });
+
 export type Command = {
   readonly cmd: 'apply';
   readonly plan: Plan;
   readonly requestId?: string;
-  readonly forceSync?: true;
-  readonly paceEditing?: true;
-};
+} & ApplyOptions;
 export type CompatibilityQuery = { readonly cmd: 'compatibility' };
 export type ApplyingQuery = { readonly cmd: 'isApplying'; readonly requestId: string };
+
+export function includesKrValueWrite(plan: Plan): boolean {
+  return plan.writes.some(({ key }) => key.startsWith(KR_VALUE_PREFIX));
+}
+
+export function krValueWrite(plan: Plan) {
+  const [write] = plan.writes;
+  if (
+    plan.v !== MODEL_VERSION ||
+    plan.origin !== 'manual' ||
+    plan.writes.length !== 1 ||
+    write?.base !== 'absent'
+  )
+    return undefined;
+
+  const decoded = decodeRecord(write.key, write.value);
+  if (!decoded.ok || !('kind' in decoded.value) || decoded.value.kind !== 'kr-value')
+    return undefined;
+  return write.value === canonicalJson(decoded.value)
+    ? { ...write, krKey: decoded.value.krKey }
+    : undefined;
+}
+
+export function isKrValuePreconditions(value: unknown): value is KrValuePreconditions {
+  return (
+    isObject(value) &&
+    (value.expectedWipe === 'absent' || isUuid(value.expectedWipe)) &&
+    (value.byteCheck === 'allow-absent' || value.byteCheck === 'require-exact')
+  );
+}
 
 export function isCommand(message: unknown): message is Command {
   if (!isObject(message) || message.cmd !== 'apply' || !isPlan(message.plan)) return false;
   const keys = Object.keys(message);
   if (!keys.includes('cmd') || !keys.includes('plan')) return false;
+  const allowed = ['cmd', 'plan', 'requestId', 'forceSync', 'paceEditing'];
+  if (includesKrValueWrite(message.plan)) {
+    if (
+      !keys.includes('expectedWipe') ||
+      !keys.includes('byteCheck') ||
+      !isKrValuePreconditions(message) ||
+      !krValueWrite(message.plan)
+    )
+      return false;
+    allowed.push('expectedWipe', 'byteCheck');
+  }
   return (
     (!('requestId' in message) || (keys.includes('requestId') && isUuid(message.requestId))) &&
     (!('forceSync' in message) || (keys.includes('forceSync') && message.forceSync === true)) &&
     (!('paceEditing' in message) ||
       (keys.includes('paceEditing') && message.paceEditing === true)) &&
-    keys.every((key) => ['cmd', 'plan', 'requestId', 'forceSync', 'paceEditing'].includes(key))
+    keys.every((key) => allowed.includes(key))
   );
 }
 
@@ -68,7 +120,9 @@ export interface GoalIntent {
   readonly fields: Readonly<Record<string, unknown>>;
 }
 
-function isEditorRecord(record: StoredRecord): record is StoredGoalRecord {
+type EditorRecord = Exclude<StoredRecord, { kind: 'kr-value' }>;
+
+function isGoalEditorRecord(record: EditorRecord): record is StoredGoalRecord {
   return !('kind' in record) || (record.kind !== 'initiative' && record.kind !== 'task-meta');
 }
 
@@ -82,20 +136,22 @@ export function goalRecords(state: PlanState) {
 }
 
 export function recordAt(state: PlanState, key: string): StoredGoalRecord | undefined {
-  const decoded = decodeRecord(key, state.entries[key] ?? '');
-  return decoded.ok && isEditorRecord(decoded.value) ? decoded.value : undefined;
+  const record = editorRecordAt(state, key);
+  return record && isGoalEditorRecord(record) ? record : undefined;
 }
 
-export function editorRecordAt(state: PlanState, key: string): StoredRecord | undefined;
+export function editorRecordAt(state: PlanState, key: string): EditorRecord | undefined;
 export function editorRecordAt<Kind extends 'initiative' | 'task-meta'>(
   state: PlanState,
   key: string,
   kind: Kind,
 ): Extract<StoredRecord, { kind: Kind }> | undefined;
 export function editorRecordAt(state: PlanState, key: string, kind?: 'initiative' | 'task-meta') {
+  if (key.startsWith(KR_VALUE_PREFIX)) return undefined;
   const decoded = decodeRecord(key, state.entries[key] ?? '');
   if (!decoded.ok) return undefined;
   const record = decoded.value;
+  if ('kind' in record && record.kind === 'kr-value') return undefined;
   return kind === undefined || ('kind' in record && record.kind === kind) ? record : undefined;
 }
 
@@ -223,7 +279,7 @@ export type EditorError =
 
 type Prepared =
   | { readonly plan: Plan; readonly write: Plan['writes'][number] }
-  | { readonly choices: DraftChoice[]; readonly record: StoredRecord | undefined }
+  | { readonly choices: DraftChoice[]; readonly record: EditorRecord | undefined }
   | { readonly message: string; readonly errors: readonly EditorError[] };
 
 export function prepareGoalPlan(options: PlanPreparation): Prepared {
@@ -274,7 +330,7 @@ export interface EditorView {
   readonly key: string;
   readonly baseVer: string;
   readonly intent: GoalIntent;
-  readonly record?: StoredRecord | undefined;
+  readonly record?: EditorRecord | undefined;
   readonly source?: string | undefined;
   readonly readOnlyReason?: string | undefined;
   readonly errors: readonly EditorError[];
@@ -342,7 +398,7 @@ export function afterWipe(
   };
 }
 
-export function afterDraftDiscard(record?: StoredRecord, source?: string): Partial<EditorView> {
+export function afterDraftDiscard(record?: EditorRecord, source?: string): Partial<EditorView> {
   return {
     record,
     intent: editorIntent(record, source),
@@ -367,7 +423,7 @@ export const removalMessages = {
   'remove-failed': failedRemoval,
 };
 
-export function editorIntent(record?: StoredRecord, source?: string): GoalIntent {
+export function editorIntent(record?: EditorRecord, source?: string): GoalIntent {
   if (record && 'kind' in record) {
     if (record.kind === 'initiative' || record.kind === 'task-meta') {
       const field = sourceField(record.kind);

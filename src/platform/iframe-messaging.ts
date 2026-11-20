@@ -17,6 +17,12 @@ interface SendOptions {
   readonly onReread?: (snapshot: ReadSnapshot) => void;
 }
 
+// The host validates the full wire command before accepting it into the queue.
+type ApplyRequest = Omit<Command, 'expectedWipe' | 'byteCheck'> & {
+  readonly expectedWipe?: unknown;
+  readonly byteCheck?: unknown;
+};
+
 interface Reply {
   readonly type?: unknown;
   readonly messageId?: unknown;
@@ -41,17 +47,17 @@ window.addEventListener('message', (event: MessageEvent<Reply | null>) => {
   complete?.(data);
 });
 
-export function send(message: Command, options?: SendOptions): Promise<PlanHandoff>;
+export function send(message: ApplyRequest, options?: SendOptions): Promise<PlanHandoff>;
 export function send(message: CompatibilityQuery): Promise<unknown>;
 export function send(
-  message: Command | CompatibilityQuery,
+  message: ApplyRequest | CompatibilityQuery,
   options: SendOptions = {},
 ): Promise<unknown> {
   return sendRequest(message, options);
 }
 
 function sendRequest(
-  message: Command | CompatibilityQuery | ApplyingQuery,
+  message: ApplyRequest | CompatibilityQuery | ApplyingQuery,
   options: SendOptions = {},
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -101,13 +107,18 @@ function sendRequest(
       }
     });
     try {
+      const observer = options.onIncomplete;
       const body =
         message.cmd === 'apply'
           ? {
               ...message,
               requestId: messageId,
-              ...(options.onIncomplete?.forceSync && { forceSync: true }),
-              ...(options.onIncomplete?.paceEditing && { paceEditing: true }),
+              ...(observer?.forceSync && { forceSync: true }),
+              ...(observer?.paceEditing && { paceEditing: true }),
+              ...(observer?.expectedWipe !== undefined && {
+                expectedWipe: observer.expectedWipe,
+                byteCheck: observer.byteCheck,
+              }),
             }
           : message;
       window.parent.postMessage({ type: 'PLUGIN_MESSAGE', messageId, message: body }, '*');

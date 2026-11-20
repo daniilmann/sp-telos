@@ -1,6 +1,11 @@
-import { EDIT_INTERVAL_MS } from '../app/commands';
+import {
+  EDIT_INTERVAL_MS,
+  includesKrValueWrite,
+  isKrValuePreconditions,
+  krValueWrite,
+} from '../app/commands';
 import { classifyPlan, type Plan, type PlanState } from '../core/plan';
-import { decodeRecord, isBaseKey, type StoredRecord } from '../core/records';
+import { decodeRecord, isBaseKey, WIPE_KEY, type StoredRecord } from '../core/records';
 import { BASE_READ_METHODS, readBaseReferences, type BaseReferences } from './base-references';
 import { missingMethodsReason, missingReadMethods, readRecords } from './facade';
 import type { HandoffOptions, PlanHandoff } from './facade';
@@ -38,6 +43,8 @@ const rejectionMessages = {
 function assignmentKeys(record?: StoredRecord): string[] {
   if (!record || !('kind' in record)) return [];
   switch (record.kind) {
+    case 'kr-value':
+      return [record.krKey];
     case 'initiative':
       return [record.projectKey, record.krKey];
     case 'task-meta':
@@ -113,10 +120,30 @@ async function verifyAssignments(state: PlanState, writes: Plan['writes']): Prom
   }
 }
 
-async function applicableWrites(plan: Plan): Promise<Plan['writes']> {
-  const { state, readOnlyReason } = await checkCompatibility(plan.writes.map(({ key }) => key));
+async function applicableWrites(plan: Plan, options?: HandoffOptions): Promise<Plan['writes']> {
+  const keys = plan.writes.map(({ key }) => key);
+  let measurement;
+  if (
+    includesKrValueWrite(plan) ||
+    (options && ('expectedWipe' in options || 'byteCheck' in options))
+  ) {
+    const write = krValueWrite(plan);
+    if (!write || !isKrValuePreconditions(options)) throw new Error(rejectionMessages.invalid);
+    measurement = { write, expectedWipe: options.expectedWipe, byteCheck: options.byteCheck };
+    keys.push(write.krKey);
+  }
+  const { state, readOnlyReason } = await checkCompatibility(keys);
   if (readOnlyReason) throw new Error(readOnlyReason);
 
+  if (measurement) {
+    const { expectedWipe, byteCheck, write } = measurement;
+    if ((storedRecord(state, WIPE_KEY)?.ver ?? 'absent') !== expectedWipe) {
+      throw new Error('Маркер очистки изменился.');
+    }
+    if (byteCheck === 'require-exact' && state.entries[write.key] !== write.value) {
+      throw new Error(rejectionMessages.stale);
+    }
+  }
   const classified = classifyPlan(state, plan);
   if (!classified.ok) throw new Error(rejectionMessages[classified.reason]);
   await verifyAssignments(state, classified.writes);
@@ -142,11 +169,11 @@ export async function apply(
   const cooldowns = options?.paceEditing
     ? plan.writes.map(({ key }) => editCooldowns?.get(key)).filter((wait) => wait !== undefined)
     : [];
-  let writes = await applicableWrites(plan);
+  let writes = await applicableWrites(plan, options);
   if (writes.length > 0 && cooldowns.length > 0) {
     await Promise.all(cooldowns);
     // Sync can replace the base while the plan waits for the write interval.
-    writes = await applicableWrites(plan);
+    writes = await applicableWrites(plan, options);
   }
 
   let transferred = 0;

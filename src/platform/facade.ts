@@ -1,12 +1,13 @@
 import { sameDraft, type Draft, type DraftStore } from './draft-store';
 import type { SaveState } from '@super-productivity/plugin-api';
-import type { Command } from '../app/commands';
+import type { ApplyOptions } from '../app/commands';
 import type { Plan, PlanState } from '../core/plan';
 import {
   decodeRecord,
   isModelVersion,
   isObject,
   isUuid,
+  KR_VALUE_PREFIX,
   MODEL_VERSION,
   RECORD_PREFIXES,
   WIPE_KEY,
@@ -29,7 +30,7 @@ export interface PlanHandoff {
   readonly writes: Plan['writes'];
 }
 
-export type HandoffOptions = Pick<Command, 'forceSync' | 'paceEditing'>;
+export type HandoffOptions = ApplyOptions;
 export type HandoffObserver = ((message: string) => void) & HandoffOptions;
 
 export function now(): number {
@@ -75,7 +76,10 @@ function invalidRecordReason(key: string, raw: string): string | undefined {
   }
   if (!isObject(record) || !isModelVersion(record.v))
     return `Только чтение. Не удалось проверить версию схемы записи ${key}.`;
-  const legacyKey = !key.startsWith('initiative:') && !key.startsWith('task-meta:');
+  const legacyKey =
+    !key.startsWith('initiative:') &&
+    !key.startsWith('task-meta:') &&
+    !key.startsWith(KR_VALUE_PREFIX);
   if (record.v !== MODEL_VERSION && !(record.v === 1 && legacyKey)) return unknownVersion;
   return key === WIPE_KEY ? 'Только чтение. Некорректная схема маркера meta:wipe.' : undefined;
 }

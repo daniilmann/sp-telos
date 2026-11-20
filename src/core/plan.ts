@@ -140,6 +140,7 @@ function classifyWrite(
 ): 'write' | 'replay' | Rejection {
   if (write.base === target.ver) return 'invalid';
   if (state.unreadKeys?.includes(write.key)) return 'invalid';
+  if ('kind' in target && target.kind === 'kr-value' && write.base !== 'absent') return 'stale';
 
   const historyLength = asKr(target)?.history.length ?? 0;
   if (origin === 'kr-revision' && (write.base === 'absent' || historyLength === 0)) {
