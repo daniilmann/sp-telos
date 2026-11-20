@@ -88,13 +88,19 @@ async function verifyAssignments(state: PlanState, writes: Plan['writes']): Prom
   const references = (
     await Promise.all(writes.map((write) => newAssignments(state, write)))
   ).flat();
+  const final = {
+    entries: {
+      ...state.entries,
+      ...Object.fromEntries(writes.map(({ key, value }) => [key, value])),
+    },
+  };
   const groups = new Set<keyof BaseReferences>();
   for (const reference of references) {
     const group = baseGroup(reference);
     if (group) {
       groups.add(group);
     } else {
-      const record = storedRecord(state, reference);
+      const record = storedRecord(final, reference);
       if (!record || !('kind' in record)) throw new Error('Новая ссылка Telos недоступна.');
     }
   }

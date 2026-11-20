@@ -327,16 +327,18 @@ export function afterWipe(
   view: EditorView,
   handled: boolean,
   discard: boolean,
+  ver: string,
 ): Partial<EditorView> {
   const status = {
     busy: false,
-    wipe: handled ? undefined : view.wipe,
+    wipe: handled && view.wipe?.ver === ver ? undefined : view.wipe,
     draftMessage: handled ? undefined : draftError,
   };
   if (!handled || !discard) return status;
   return {
     ...status,
     ...afterDraftDiscard(view.record, view.source),
+    message: view.readOnlyReason,
   };
 }
 
@@ -365,7 +367,7 @@ export const removalMessages = {
   'remove-failed': failedRemoval,
 };
 
-function editorIntent(record?: StoredRecord, source?: string): GoalIntent {
+export function editorIntent(record?: StoredRecord, source?: string): GoalIntent {
   if (record && 'kind' in record) {
     if (record.kind === 'initiative' || record.kind === 'task-meta') {
       const field = sourceField(record.kind);

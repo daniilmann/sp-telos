@@ -1,7 +1,13 @@
 import type { ComponentChildren } from 'preact';
 import type { EditorView, GoalIntent } from '../../app/commands';
 import { linkedSource, type LinkedReferences } from '../../app/initiative-task-links';
-import { isKeyList, linkedKind, sourceField, stringField } from '../../app/linked-editor-intent';
+import {
+  changeDirectKrSelection,
+  directKrSelection,
+  linkedKind,
+  sourceField,
+  stringField,
+} from '../../app/linked-editor-intent';
 import { MultipleReferences, ReferencePicker, type ReferenceOptions } from './ReferencePicker';
 
 type LinkListProps = {
@@ -127,13 +133,16 @@ export function LinkForm({ view, links, input, save, retry, back, draftActions }
   if (!kind) return null;
   const record = view.record && 'kind' in view.record ? view.record : undefined;
   const source =
-    linkedSource(record) ?? stringField(view.intent.fields, sourceField(kind)) ?? view.source;
+    view.source ?? linkedSource(record) ?? stringField(view.intent.fields, sourceField(kind));
   const origins = kind === 'initiative' ? links.projects : links.tasks;
   const origin = source ? origins[source] : undefined;
   const disabled = Boolean(view.readOnly || view.draftChoices || view.wipe);
   const { intent } = view;
-  const change = (field: string, value: string | null | readonly string[]) => {
-    input({ ...intent, fields: { ...intent.fields, [field]: value } });
+  const changeFields = (fields: GoalIntent['fields']) => {
+    input({ ...intent, fields });
+  };
+  const change = (field: string, value: string | null) => {
+    changeFields({ ...intent.fields, [field]: value });
   };
   const title = kind === 'initiative' ? 'Инициатива' : 'Связи задачи';
   return (
@@ -172,7 +181,7 @@ export function LinkForm({ view, links, input, save, retry, back, draftActions }
             ) : (
               <TaskFields
                 record={record?.kind === 'task-meta' ? record : undefined}
-                {...{ intent, links, change }}
+                {...{ intent, links, change, changeFields }}
               />
             )}
           </fieldset>
@@ -233,7 +242,7 @@ interface FieldsProps<Kind> {
   readonly intent: GoalIntent;
   readonly links: LinkedReferences;
   readonly record: Extract<LiveRecord, { kind: Kind }> | undefined;
-  readonly change: (field: string, value: string | null | readonly string[]) => void;
+  readonly change: (field: string, value: string | null) => void;
 }
 
 function InitiativeFields({
@@ -276,10 +285,14 @@ function InitiativeFields({
   );
 }
 
-function TaskFields({ record, intent: { fields }, links, change }: FieldsProps<'task-meta'>) {
-  const direct = isKeyList(fields.directKrKeys)
-    ? fields.directKrKeys
-    : (record?.directKrKeys ?? []);
+function TaskFields({
+  record,
+  intent: { fields },
+  links,
+  change,
+  changeFields,
+}: FieldsProps<'task-meta'> & { readonly changeFields: (fields: GoalIntent['fields']) => void }) {
+  const direct = directKrSelection(fields, record?.directKrKeys ?? []);
   return (
     <>
       <ReferencePicker
@@ -296,7 +309,7 @@ function TaskFields({ record, intent: { fields }, links, change }: FieldsProps<'
         options={links.krs}
         values={direct}
         change={(keys) => {
-          change('directKrKeys', keys);
+          changeFields(changeDirectKrSelection(fields, direct, keys));
         }}
       />
       <SphereField

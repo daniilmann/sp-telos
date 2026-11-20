@@ -63,6 +63,8 @@ function isRecordKey(key: string): boolean {
 }
 
 const unknownVersion = 'Только чтение. Обновите плагин: обнаружена неизвестная версия схемы.';
+const enumerationFailure = 'Только чтение. Не удалось перечислить ключи для проверки схемы.';
+export const enumerationTimeout = `${enumerationFailure} Истекло время ожидания ответа.`;
 
 function invalidRecordReason(key: string, raw: string): string | undefined {
   let record: unknown;
@@ -147,7 +149,7 @@ async function readRecord(key: string, listed: boolean): Promise<RecordRead> {
 
 export async function readRecords(additionalKeys: readonly string[] = []): Promise<ReadSnapshot> {
   const missing = missingReadMethods();
-  let readOnlyReason = missingMethodsReason(missing);
+  const readOnlyReason = missingMethodsReason(missing);
   if (readOnlyReason && missing.includes('loadSyncedData')) return { entries: {}, readOnlyReason };
 
   const collections = missing.includes('listSyncedDataKeys')
@@ -156,11 +158,12 @@ export async function readRecords(additionalKeys: readonly string[] = []): Promi
         RECORD_PREFIXES.map(async (prefix) => PluginAPI.listSyncedDataKeys(prefix)),
       );
   const listed = new Set<string>();
+  const failures: unknown[] = [];
   for (const collection of collections) {
     if (collection.status === 'fulfilled') {
       for (const key of collection.value) listed.add(key);
     } else {
-      readOnlyReason ??= 'Только чтение. Не удалось перечислить ключи для проверки схемы.';
+      failures.push(collection.reason);
     }
   }
   // Pending writes may be readable by key before they appear in the collection listing.
@@ -168,7 +171,12 @@ export async function readRecords(additionalKeys: readonly string[] = []): Promi
   const reads = await Promise.all(
     keys.map(async (key) => [key, await readRecord(key, listed.has(key))] as const),
   );
-  return snapshotFromReads(reads, readOnlyReason);
+  const snapshot = snapshotFromReads(reads, readOnlyReason);
+  if (snapshot.readOnlyReason || failures.length === 0) return snapshot;
+  const timedOut = failures.every(
+    (error) => error instanceof Error && error.message === 'API call timeout',
+  );
+  return { ...snapshot, readOnlyReason: timedOut ? enumerationTimeout : enumerationFailure };
 }
 
 export function createHostFacade() {
@@ -205,6 +213,7 @@ export async function handoffGoalPlan(
     return {
       applied: refreshed?.entries[key] === value,
       message: error instanceof Error ? error.message : 'Состояние неизвестно',
+      refreshed,
     };
   }
 }

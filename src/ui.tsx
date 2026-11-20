@@ -9,6 +9,7 @@ import { WIPE_KEY } from './core/records';
 import { createDraftStore } from './platform/draft-store';
 import {
   createHostFacade,
+  enumerationTimeout,
   newId,
   now,
   type EditorFacade,
@@ -27,6 +28,7 @@ function isRefreshHook(hook: string): hook is RefreshHook {
 
 interface ViewActions {
   readonly load: () => void;
+  readonly open: (key: string) => void;
   readonly openSource: (source: string) => void;
   readonly discard: (key: string) => void;
 }
@@ -60,6 +62,7 @@ function View() {
     let readNumber = 0;
     let selection = 0;
     let displayed = 0;
+    let hookFailure = '';
     const stamps = new WeakMap<ReadSnapshot, number>();
     const drafts = createDraftStore();
     const host = createHostFacade();
@@ -69,13 +72,20 @@ function View() {
         send({ cmd: 'apply', plan }, onIncomplete ? { onIncomplete } : undefined),
       async read(keys?: readonly string[]) {
         const stamp = ++readNumber;
+        const compatibilityFailure = 'Только чтение. Не удалось проверить совместимость основы.';
         const compatibility = send({ cmd: 'compatibility' }).then(
-          (reason) => (typeof reason === 'string' ? reason : undefined),
-          () => 'Только чтение. Не удалось проверить совместимость основы.',
+          (reason) => {
+            if (reason === null) return undefined;
+            return typeof reason === 'string' && reason ? reason : compatibilityFailure;
+          },
+          () => compatibilityFailure,
         );
         const [result, reason] = await Promise.all([host.read(keys), compatibility]);
-        const snapshot =
-          reason && !result.readOnlyReason ? { ...result, readOnlyReason: reason } : result;
+        const readOnlyReason =
+          [result.readOnlyReason, reason].find((issue) => issue && issue !== enumerationTimeout) ??
+          result.readOnlyReason ??
+          reason;
+        const snapshot = readOnlyReason ? { ...result, readOnlyReason } : result;
         stamps.set(snapshot, stamp);
         return snapshot;
       },
@@ -96,16 +106,15 @@ function View() {
     });
     setModel({ editor, view: editor.view() });
 
-    async function publish(snapshot: ReadSnapshot, updateOpen = false) {
+    async function publish(snapshot: ReadSnapshot) {
       const stamp = stamps.get(snapshot) ?? 0;
       const latest = () => active && stamp >= displayed;
       const listed = await drafts.list();
       if (!latest()) return;
       displayed = stamp;
       setData({ snapshot, draftKeys: listed.keys });
-      setMessage(listed.failed ? 'Не удалось прочитать список черновиков.' : '');
+      setMessage(listed.failed ? 'Не удалось прочитать список черновиков.' : hookFailure);
       void publishReferences(snapshot, listed.keys, latest);
-      if (updateOpen) await editor.refresh(snapshot, latest);
       return listed.keys;
     }
 
@@ -128,8 +137,10 @@ function View() {
     async function load(initial = false) {
       try {
         const key = editor.view().key;
+        const updateOpen = editor.beginRefresh();
         const result = await facade.read(key ? [key] : undefined);
-        const keys = await publish(result, true);
+        const [keys] = await Promise.all([publish(result), updateOpen(result)]);
+        if (initial && keys && result.readOnlyReason === enumerationTimeout) void load();
         const wipe = recordAt(result, WIPE_KEY)?.ver;
         if (initial && keys?.[0] && wipe) {
           const handled = await drafts.readWipeVersion().catch(() => undefined);
@@ -144,10 +155,20 @@ function View() {
       if (active) void load();
     }
     for (const hook of refreshHooks) {
-      if (isRefreshHook(hook)) PluginAPI.registerHook(hook, refresh);
+      if (!isRefreshHook(hook)) continue;
+      void Promise.resolve()
+        .then(PluginAPI.registerHook.bind(PluginAPI, hook, refresh))
+        .catch(() => {
+          hookFailure = 'Не удалось подписаться на обновления. Доступно ручное обновление.';
+          if (active) setMessage(hookFailure);
+        });
     }
     setActions({
       load: refresh,
+      open(key) {
+        selection += 1;
+        void editor.open(key);
+      },
       openSource(source) {
         const requested = ++selection;
         void host
@@ -181,9 +202,7 @@ function View() {
 
   if (!model || !actions) return <p role="status">{message}</p>;
   const { editor, view } = model;
-  const open = (key: string) => {
-    void editor.open(key);
-  };
+  const open = actions.open;
   return (
     <App
       editor={editor}

@@ -4,11 +4,12 @@ import {
   updateInitiative,
   updateTaskLinks,
 } from '../core/initiative-task-links';
-import { WIPE_KEY, splitRecord, type StoredRecord } from '../core/records';
+import { WIPE_KEY, splitRecord } from '../core/records';
 import type { PlanState } from '../core/plan';
 import type { BaseReferences } from '../platform/base-references';
 import { sameDraft, type DraftStore } from '../platform/draft-store';
 import type { EditorFacade } from '../platform/facade';
+import { linkedRecordSource as linkedSource } from '../platform/linked-record-keys';
 import {
   absent,
   afterDraftDiscard,
@@ -29,12 +30,18 @@ import {
   type GoalIntent,
 } from './commands';
 import {
-  isKeyList,
+  checkedEditorRead,
+  directKrEdit,
+  editorSelection,
   isLinkedSource,
   linkedKind,
+  pendingWipe,
+  readOnlyPatch,
   sourceField,
   stringField,
 } from './linked-editor-intent';
+
+export { linkedSource };
 
 export function availableLinks(state: PlanState, references: BaseReferences) {
   return {
@@ -96,13 +103,14 @@ function linkedTransition(
       const current = editorRecordAt(state, key, 'task-meta');
       const initiativeKey = nullableSelection(fields.initiativeKey);
       const sphereTagKey = nullableSelection(fields.sphereTagKey);
+      const directKrKeys = directKrEdit(fields, current?.directKrKeys);
       return updateTaskLinks(
         current?.taskKey ?? stringField(fields, 'taskKey') ?? '',
         current,
         {
           ...(initiativeKey !== undefined && { initiativeKey }),
           ...(sphereTagKey !== undefined && { sphereTagKey }),
-          ...(isKeyList(fields.directKrKeys) && { directKrKeys: fields.directKrKeys }),
+          ...(directKrKeys && { directKrKeys }),
         },
         available,
       );
@@ -210,10 +218,9 @@ export async function resolveLinkedReferences(
 
 export type LinkedReferences = Awaited<ReturnType<typeof resolveLinkedReferences>>;
 
-export function linkedSource(record?: StoredRecord): string | undefined {
-  if (record && 'kind' in record) {
-    if (record.kind === 'initiative') return record.projectKey;
-    if (record.kind === 'task-meta') return record.taskKey;
+function refreshedConflict(view: EditorView, record: EditorView['record']) {
+  if (record?.ver !== view.record?.ver) {
+    return { record, draftChoices: draftChoices(record, view.baseVer) };
   }
   return undefined;
 }
@@ -233,20 +240,23 @@ export async function prepareDraftTransfer(
   }
   const key = await facade.linkedRecordKey(target);
   const [state, references, source] = await Promise.all([
-    facade.read([key, WIPE_KEY]),
+    facade.read([view.key, key, WIPE_KEY]),
     facade.readBaseReferences?.(),
     drafts.read(view.key),
   ]);
+  const checked = await checkedEditorRead(drafts, state, view.key, view.source);
+  if (!current()) return {};
+  if (checked.readOnlyReason) return readOnlyPatch(checked);
+  if (checked.wipe) return { wipe: checked.wipe };
+  const conflict = refreshedConflict(view, checked.record);
+  if (conflict) return conflict;
+  const destination = await editorSelection(state, key, target);
   const targets = kind === 'initiative' ? references?.projects : references?.tasks;
   if (!current()) return {};
-  if (
-    key === view.key ||
-    !targets?.[target] ||
-    state.readOnlyReason ||
-    state.entries[key] !== undefined ||
-    state.unreadKeys?.includes(key)
-  ) {
-    return { draftMessage: 'Для этого объекта нельзя восстановить черновик.' };
+  if (key === view.key || !targets?.[target] || destination.readOnlyReason || destination.record) {
+    return {
+      draftMessage: destination.readOnlyReason ?? 'Для этого объекта нельзя восстановить черновик.',
+    };
   }
   const expected = {
     at,
@@ -273,27 +283,6 @@ export async function prepareDraftTransfer(
     status: 'changed',
     message: changed,
     draftMessage: result?.ok ? undefined : failedRemoval,
-  };
-}
-
-export function refreshedView(
-  view: EditorView,
-  state: PlanState,
-  readOnlyReason: string | undefined,
-  wipe: EditorView['wipe'],
-  dirty: boolean,
-): Partial<EditorView> {
-  const record = editorRecordAt(state, view.key);
-  const available = dirty
-    ? { record, draftChoices: draftChoices(record, view.baseVer) }
-    : { record, ...afterDraftDiscard(record, view.source), status: view.status };
-  const editedMessage = dirty ? changed : undefined;
-  return {
-    ...(view.ready && !view.busy && available),
-    readOnly: Boolean(readOnlyReason),
-    readOnlyReason,
-    wipe,
-    message: readOnlyReason ?? (view.readOnlyReason ? editedMessage : view.message),
   };
 }
 
@@ -326,18 +315,20 @@ export async function resolveEditorDraft({
 }: DraftResolution): Promise<void> {
   const { key, record, intent } = view;
   const snapshot = await facade.read([key, WIPE_KEY]);
+  const checked = await checkedEditorRead(drafts, snapshot, key, view.source);
   if (!current()) return;
-  const remote = editorRecordAt(snapshot, key);
-  if (snapshot.readOnlyReason && choice !== 'discard-draft' && choice !== 'use-saved') {
-    update({
-      readOnly: true,
-      readOnlyReason: snapshot.readOnlyReason,
-      message: snapshot.readOnlyReason,
-    });
+  const { record: remote, readOnlyReason, blocked, wipe } = checked;
+  if (blocked || (readOnlyReason && choice !== 'discard-draft' && choice !== 'use-saved')) {
+    update(readOnlyPatch(checked));
     return;
   }
-  if (remote?.ver !== record?.ver) {
-    update({ record: remote, draftChoices: draftChoices(remote, view.baseVer) });
+  if (wipe) {
+    update({ wipe });
+    return;
+  }
+  const conflict = refreshedConflict(view, remote);
+  if (conflict) {
+    update(conflict);
     return;
   }
   if (choice === 'keep-draft') {
@@ -357,6 +348,24 @@ export async function resolveEditorDraft({
       return;
     }
     const newKey = `${key.split(':')[0] ?? ''}:${newId()}`;
+    const targetState = await facade.read([newKey, WIPE_KEY]);
+    const wipe = await pendingWipe(drafts, targetState);
+    if (!current()) return;
+    if (wipe) {
+      update({ wipe });
+      return;
+    }
+    if (
+      targetState.readOnlyReason ||
+      targetState.entries[newKey] !== undefined ||
+      targetState.unreadKeys?.includes(newKey)
+    ) {
+      update({
+        draftMessage:
+          targetState.readOnlyReason ?? 'Для этого объекта нельзя восстановить черновик.',
+      });
+      return;
+    }
     update({
       ...afterDraftDiscard(),
       key: newKey,
