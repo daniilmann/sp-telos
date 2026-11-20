@@ -1,4 +1,6 @@
 import { vi } from 'vitest';
+import type { PluginAppState, Task } from '@super-productivity/plugin-api';
+import { EDIT_INTERVAL_MS } from '../../src/app/commands';
 import {
   applyPlan,
   buildPlan,
@@ -85,6 +87,65 @@ export function versionOf(write: Plan['writes'][number]): string {
   return decoded.value.ver;
 }
 
+export function baseTask(id: string, title = id): Task {
+  return {
+    id,
+    title,
+    timeEstimate: 0,
+    timeSpent: 0,
+    isDone: false,
+    projectId: null,
+    tagIds: [],
+    created: 1,
+    subTaskIds: [],
+  };
+}
+
+export function baseAppState(
+  projects: PluginAppState['projects'] = {},
+  tags: PluginAppState['tags'] = {},
+): PluginAppState {
+  return {
+    projects,
+    tags,
+    tasks: {},
+    notes: {},
+    taskRepeatCfgs: {},
+    simpleCounters: {},
+    globalConfig: {},
+  };
+}
+
+export function baseProject(id: string, title = id, isArchived = false) {
+  return {
+    id,
+    title,
+    isArchived,
+    theme: {},
+    taskIds: [],
+    backlogTaskIds: [],
+    noteIds: [],
+    advancedCfg: {},
+  };
+}
+
+export function baseTag(id: string, title = id) {
+  return { id, title, created: 1, taskIds: [], theme: {}, advancedCfg: {} };
+}
+
+export async function collideOnLinkedKey(source: string) {
+  const namespace = '6677f4a3a43854c49e72a4cf18f83b4d';
+  const bytes = new Uint8Array([
+    ...namespace.match(/../g)!.map((byte) => Number.parseInt(byte, 16)),
+    ...new TextEncoder().encode(source),
+  ]);
+  const hash = crypto.subtle.digest.bind(crypto.subtle);
+  const digest = await hash('SHA-1', bytes);
+  vi.spyOn(crypto.subtle, 'digest').mockImplementation((algorithm, data) =>
+    algorithm === 'SHA-1' ? Promise.resolve(digest.slice(0)) : hash(algorithm, data),
+  );
+}
+
 /** Fake only the host API. Handoff and asynchronous commit have independent barriers. */
 export function createFakeHost(initial: PlanState = EMPTY_STATE) {
   const committed = new Map(Object.entries(initial.entries));
@@ -129,6 +190,9 @@ export function createFakeHost(initial: PlanState = EMPTY_STATE) {
     }),
     registerMenuEntry: vi.fn<typeof PluginAPI.registerMenuEntry>(),
     showIndexHtmlAsView: vi.fn<typeof PluginAPI.showIndexHtmlAsView>(),
+    getAppState: vi.fn<typeof PluginAPI.getAppState>().mockResolvedValue(baseAppState()),
+    getTasks: vi.fn<typeof PluginAPI.getTasks>().mockResolvedValue([]),
+    getArchivedTasks: vi.fn<typeof PluginAPI.getArchivedTasks>().mockResolvedValue([]),
     listSyncedDataKeys: vi.fn<typeof PluginAPI.listSyncedDataKeys>((prefix = '') =>
       Promise.resolve(
         [...committed]
@@ -156,6 +220,12 @@ export function createFakeHost(initial: PlanState = EMPTY_STATE) {
     ready: async () => ready?.(),
     committed: (): PlanState => ({ entries: Object.fromEntries(committed) }),
     receiveSync: (key: string, value: string) => committed.set(key, value),
+    receiveImport: (entries: PlanState['entries']) => {
+      committed.clear();
+      pending.clear();
+      receipts.clear();
+      for (const [key, value] of Object.entries(entries)) committed.set(key, value);
+    },
     acknowledge(key: string, savedAt: number) {
       const value = committed.get(key);
       if (value === undefined) throw new Error('There is no committed value to acknowledge.');
@@ -170,4 +240,43 @@ export function createFakeHost(initial: PlanState = EMPTY_STATE) {
       pending.clear();
     },
   };
+}
+
+export type FakeHost = ReturnType<typeof createFakeHost>;
+
+export async function startLinkedHost(
+  host: FakeHost,
+  api: Partial<FakeHost['api']> = host.api,
+  loadPlugin: () => Promise<unknown> = () => import('../../src/plugin'),
+) {
+  vi.stubGlobal('PluginAPI', api);
+  await loadPlugin();
+  await host.ready();
+  return {
+    apply: (plan: Plan, paceEditing = false) =>
+      host.deliver({ cmd: 'apply', plan, ...(paceEditing && { paceEditing: true }) }),
+    compatibility: () => host.deliver({ cmd: 'compatibility' }),
+  };
+}
+
+export async function reachEditBoundary(
+  host: FakeHost,
+  key: string,
+  submit: () => Promise<unknown>,
+) {
+  const load = host.api.loadSyncedData.getMockImplementation()!;
+  const read = createDeferred();
+  host.api.loadSyncedData.mockImplementation(async (requested) => {
+    const value = await load(requested);
+    if (requested === key) read.resolve();
+    return value;
+  });
+  const outcome = submit().catch((error: unknown) => error);
+  try {
+    await Promise.race([read.promise, outcome]);
+    await vi.advanceTimersByTimeAsync(EDIT_INTERVAL_MS - 1);
+    return { outcome };
+  } finally {
+    host.api.loadSyncedData.mockImplementation(load);
+  }
 }
