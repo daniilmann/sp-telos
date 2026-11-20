@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { FrameLocator } from '@playwright/test';
-import { buildPlan } from '../../src/core/plan';
+import { buildPlan, MODEL_VERSION } from '../../src/core/plan';
 import {
   draft,
   draftKeys,
@@ -272,7 +272,7 @@ for (const isClosed of [false, true]) {
     const updated = await onlyRecord(frame, 'kr:');
     const { v, at, ver, history, ...previous } = original.value;
     expect({ v, at, ver, history }).toMatchObject({
-      v: 1,
+      v: MODEL_VERSION,
       at: expect.any(Number),
       ver: expect.any(String),
       history: [],
