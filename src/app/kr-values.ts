@@ -1,66 +1,37 @@
-import { buildPlan, EMPTY_STATE, isPlan, type Plan } from '../core/plan';
+import { buildPlan, EMPTY_STATE, type Plan } from '../core/plan';
 import * as records from '../core/records';
 import { sameDraft, type Draft, type DraftStore } from '../platform/draft-store';
 import { handoffGoalPlan, removeConfirmedDraft, type ReadSnapshot } from '../platform/facade';
 import {
   absent,
   draftError,
-  krValueWrite,
   recordAt,
   removalMessages,
   type GoalEditorDependencies as EditorDeps,
   type ApplyOptions,
 } from './commands';
+import {
+  action,
+  listKrValueDrafts,
+  readDraft,
+  readMeasurements,
+  type KrValueDraft,
+} from './kr-value-drafts';
 import { pendingWipe } from './linked-editor-intent';
 import { createSaveStatus, saveMessage, type SaveStatus } from './save-status';
 
-const action = 'record-kr-value';
+export { listKrValueDrafts } from './kr-value-drafts';
+
 const cleared = { input: undefined, rejected: false, error: undefined, receipt: undefined };
 export const unconfirmed = 'Сохранение не подтверждено';
 export const unconfirmedMessage = `${unconfirmed} · Повторить`;
 
-interface Input {
-  readonly key: string;
-  readonly krKey: string;
-  readonly value: string;
-  readonly expectedWipe: string;
-  draft: Draft;
-  readonly sent?: { plan: Plan; write: Plan['writes'][number]; ver: string };
+interface Input extends KrValueDraft {
+  observation?: { expected: Draft; outcome?: ReturnType<DraftStore['markObserved']> };
 }
 
-function readFact(key: string, raw: string) {
-  const decoded = records.decodeRecord(key, raw);
-  return decoded.ok && 'kind' in decoded.value && decoded.value.kind === 'kr-value'
-    ? { ...decoded.value, key }
-    : undefined;
-}
-
-function readDraft(key: string, draft?: Draft): Input | undefined {
-  if (!draft || !records.isRecordKeyOfKind(key, 'kr-value')) return undefined;
-  const { krKey, value, expectedWipe, plan } = draft.fields;
-  if (
-    draft.fields.action !== action ||
-    typeof krKey !== 'string' ||
-    !records.isRecordKeyOfKind(krKey, 'kr') ||
-    typeof value !== 'string' ||
-    (expectedWipe !== absent && !records.isUuid(expectedWipe))
-  )
-    return undefined;
-  const input = { key, krKey, value, expectedWipe, draft };
-  if (!isPlan(plan)) return plan === undefined && draft.baseVer === absent ? input : undefined;
-  const write = krValueWrite(plan);
-  if (write?.key !== key || write.krKey !== krKey) return undefined;
-  const fact = readFact(key, write.value);
-  if (fact?.value !== value || ![absent, fact.ver].includes(draft.baseVer)) return undefined;
-  return { ...input, sent: { plan, write, ver: fact.ver } };
-}
-
-export async function listKrValueDrafts(drafts: DraftStore, keys: readonly string[]) {
-  const read = async (key: string) => readDraft(key, (await drafts.read(key)).value);
-  const rows = await Promise.all(
-    keys.filter((key) => key.startsWith(records.KR_VALUE_PREFIX)).map(read),
-  );
-  return rows.filter((item) => item !== undefined).sort((a, b) => b.draft.at - a.draft.at);
+function unmarked(input: Input): boolean {
+  return input.observation !== undefined && input.observation.outcome?.state !== 'updated';
 }
 
 type Dependencies = Pick<EditorDeps, 'facade' | 'drafts' | 'now' | 'newId' | 'onChange'>;
@@ -124,8 +95,9 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
   let displayed = 0;
   const changed = () => onChange?.();
   const selected = (target: Card) => card === target && !target.paused;
-  const current = (target: Card, input: Input | undefined) =>
-    selected(target) && target.input === input;
+  const owns = (target: Card, input: Input | undefined) =>
+    card === target && target.input === input;
+  const current = (target: Card, input: Input | undefined) => !target.paused && owns(target, input);
   const consistent = (target: Card) =>
     target.snapshot !== undefined && !snapshotIssue(target) && !target.wipe && !conflict(target);
   const writable = (target: Card) => !target.snapshot?.readOnlyReason && consistent(target);
@@ -176,14 +148,14 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
   }
 
   async function remove(target: Card, input: Input, confirmed = false): Promise<void> {
-    if (target.removing) return;
+    if (target.removing || (confirmed && unmarked(input))) return;
     target.removing = true;
     const applicable = () =>
       current(target, input) &&
       (!confirmed ||
         (target.receipt === 'saved' && writable(target) && exact(target, input.sent?.write)));
     try {
-      const result = await removeConfirmedDraft(drafts, input.key, input.draft, applicable);
+      const result = await removeLocal(input, applicable);
       if (!applicable()) return;
       target.draftMessage = result ? removalMessages[result] : undefined;
       if (result !== 'removed') return;
@@ -196,18 +168,52 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
     }
   }
 
-  async function observe(target: Card, input: Input): Promise<void> {
+  async function removeLocal(input: Input, applicable: () => boolean) {
+    const { observation, key } = input;
+    if (observation && unmarked(input)) {
+      if (!(await drafts.flush()).ok) return 'write-failed';
+      if (!applicable()) return;
+      if (unmarked(input)) {
+        const removal = drafts.removeConfirmed(key, observation.expected, applicable, true);
+        if (!removal) return;
+        const result = await drafts.flush();
+        if (removal.state === 'skipped') return 'skipped';
+        if (!result.ok) return 'remove-failed';
+        return removal.state === 'removed' ? 'removed' : undefined;
+      }
+    }
+    return removeConfirmedDraft(drafts, key, input.draft, applicable);
+  }
+
+  function observe(target: Card, input: Input): Promise<void> | undefined {
     const ver = input.sent?.ver;
+    // Navigation pauses handoff before flushing, while this card still owns its draft.
     const applicable = () =>
-      current(target, input) && exact(target, input.sent?.write) && consistent(target);
-    if (!ver || input.draft.baseVer === ver || !applicable() || !(await sameLocal(input))) return;
-    if (!applicable() || input.draft.baseVer === ver) return;
-    // Keep the observation in memory across a flush failure. Retry must still flush it before handoff.
-    input.draft = { ...input.draft, baseVer: ver };
-    drafts.write(input.key, input.draft);
-    target.marking = drafts.flush().then((result) => {
+      owns(target, input) &&
+      !target.removing &&
+      exact(target, input.sent?.write) &&
+      consistent(target);
+    if (target.marking) return target.marking;
+    if (!ver || !applicable() || input.observation?.outcome) return;
+    if (!input.observation && input.draft.baseVer === ver) return;
+
+    // Keep require-exact in the live input even if the guarded write fails or is skipped.
+    const observation = (input.observation ??= { expected: input.draft });
+    input.draft = { ...observation.expected, baseVer: ver };
+    const enqueue = () => drafts.markObserved(input.key, observation.expected, ver, applicable);
+    const persist = async () => {
+      observation.outcome = enqueue();
+      if (!observation.outcome) {
+        // A queued edit must settle before the observation can compare it on disk.
+        const settled = await drafts.flush();
+        if (!settled.ok || !applicable()) return settled;
+        observation.outcome = enqueue();
+      }
+      return drafts.flush();
+    };
+    target.marking = persist().then((result) => {
       target.marking = undefined;
-      if (current(target, input)) target.draftMessage = result.ok ? undefined : draftError;
+      if (owns(target, input)) target.draftMessage = result.ok ? undefined : draftError;
       if (card === target) changed();
     });
     return target.marking;
@@ -229,7 +235,6 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       changed();
       if (!input) return;
       await observe(target, input);
-      await target.marking;
       if (latest() && !target.saving) await track(target, input);
     };
   }
@@ -302,6 +307,7 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       return;
     }
     const applicable = () => current(target, attempt) && writable(target);
+    const ready = () => applicable() && !unmarked(attempt);
     target.input = target.saving = attempt;
     if (attempt !== initial) drafts.write(attempt.key, attempt.draft);
     changed();
@@ -311,9 +317,9 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       const settled = await drafts.flush();
       if (!current(target, attempt)) return;
       target.draftMessage = settled.ok ? undefined : draftError;
-      if (!settled.ok || !applicable() || !(await sameLocal(attempt)) || !applicable()) return;
-      if (source) await removeConfirmedDraft(drafts, source.key, source.draft, applicable);
-      if (applicable()) await handoff(target, attempt, retry);
+      if (!settled.ok || !ready() || !(await sameLocal(attempt)) || !ready()) return;
+      if (source) await removeLocal(source, ready);
+      if (ready()) await handoff(target, attempt, retry);
     } catch {
       if (current(target, attempt)) target.message = saveMessage({ state: 'unknown' });
     } finally {
@@ -392,11 +398,12 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
     },
     view() {
       const reason = readOnly(card);
+      const alive = live(card);
       return {
         key: card.key,
         ready: card.snapshot !== undefined,
-        live: live(card),
-        measurements: measurements(card),
+        live: alive,
+        measurements: alive ? readMeasurements(card.key, card.snapshot?.entries) : [],
         ...(card.input && { draftKey: card.input.key }),
         value: card.input?.value ?? '',
         busy: !idle(card),
@@ -412,17 +419,6 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       };
     },
   };
-}
-
-function measurements(card: Card) {
-  if (!live(card)) return [];
-  return Object.entries(card.snapshot?.entries ?? {})
-    .flatMap(([key, raw]) => {
-      if (!key.startsWith(records.KR_VALUE_PREFIX)) return [];
-      const fact = readFact(key, raw);
-      return fact?.krKey === card.key ? [fact] : [];
-    })
-    .sort((a, b) => a.at - b.at || a.key.localeCompare(b.key));
 }
 
 function measurementStatus(status: SaveStatus, visible: boolean): string {

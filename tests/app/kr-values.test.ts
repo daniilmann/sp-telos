@@ -1,123 +1,25 @@
 import { afterEach, assert, beforeEach, expect, it, vi } from 'vitest';
 import { draftError } from '../../src/app/commands';
-import { createKrValueEditor, type KrValueEditor as Editor } from '../../src/app/kr-values';
-import type { Plan } from '../../src/core/plan';
 import * as records from '../../src/core/records';
-import { createDraftStore, type Draft } from '../../src/platform/draft-store';
-import * as platform from '../../src/platform/facade';
-import { createFakeDraftDatabase } from '../fakes/fake-draft-database';
-import { createDeferred, createFakeHost, startLinkedHost, versionOf } from '../fakes/fake-facade';
+import { createDeferred } from '../fakes/fake-facade';
+import {
+  at,
+  closed,
+  enter,
+  fact,
+  factKey,
+  fixture,
+  krKey,
+  observe,
+  otherKr,
+  submit,
+  tick,
+  tombstone,
+  uuid,
+  value,
+} from './kr-values-fixture';
 
-const at = Date.UTC(2026, 10, 18, 9, 7);
-const uuid = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
-const krKey = `kr:${uuid(1)}`;
-const otherKr = `kr:${uuid(2)}`;
-const factKey = (n: number) => `kr-value:${uuid(n)}`;
-const body = {
-  kind: 'kr',
-  objectiveKey: `objective:${uuid(3)}`,
-  statement: 'Результат',
-  baseline: '2',
-  target: '4',
-  dataSource: 'Журнал',
-};
-const closure = { status: 'closed', outcome: 'achieved', closureReason: 'Итог проверен' };
-const version = (id: number) => ({ at, v: 2, ver: uuid(id) });
-const closed = records.canonicalJson({
-  ...body,
-  ...closure,
-  ...version(11),
-  history: [{ ...body, ...closure, target: '3', revisionReason: 'Уточнение' }],
-});
-const legacy = records.canonicalJson({
-  ...body,
-  ...version(12),
-  status: 'active',
-  v: 1,
-  history: [],
-});
-const value = 'Практика устойчива три недели';
 const saved = /Сохранено в \d{2}:\d{2}/;
-const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
-const fact = (text: string, kr = krKey, ver = uuid(13)) =>
-  records.canonicalJson({ kind: 'kr-value', krKey: kr, value: text, at, ver, v: 2 });
-const tombstone = records.canonicalJson({ ...version(40), deleted: true });
-
-async function fixture(extra: platform.ReadSnapshot['entries'] = {}) {
-  const initial = { [krKey]: closed, [otherKr]: legacy, ...extra };
-  const host = createFakeHost({ entries: initial });
-  await startLinkedHost(host);
-  const boundary = platform.createHostFacade();
-  const apply = async (plan: Plan, options?: platform.HandoffOptions) =>
-    (await host.deliver({ cmd: 'apply', plan, ...options })) as platform.PlanHandoff;
-  const facade = {
-    ...boundary,
-    read: vi.fn(boundary.read),
-    apply: vi.fn(apply),
-  };
-  const db = createFakeDraftDatabase();
-  let drafts = createDraftStore(db.factory);
-  let nextId = 100;
-  const rows = () => db.committedRows('sp-telos-drafts');
-  const disk = (key: string) => rows().get(key) as Draft | undefined;
-  async function mutation(key: string) {
-    await tick();
-    const pending = db.mutations.filter(({ finished }) => !finished);
-    expect(pending.map(({ pendingKeys }) => pendingKeys)).toEqual([[key]]);
-    return pending[0]!;
-  }
-  async function finish(operation?: Promise<unknown>) {
-    await tick();
-    for (const transaction of db.mutations) {
-      if (transaction.finished) continue;
-      transaction.succeedRequest();
-      transaction.complete();
-      await tick();
-    }
-    await operation;
-  }
-  async function open(key = krKey) {
-    const newId = () => uuid(nextId++);
-    const editor = createKrValueEditor({ facade, drafts, now: Date.now, newId });
-    await editor.open(key);
-    return editor;
-  }
-  function restart(editor: Editor) {
-    editor.close();
-    db.restart();
-    drafts = createDraftStore(db.factory);
-    return open();
-  }
-  async function refresh(editor: Editor) {
-    await editor.beginRefresh()(await facade.read());
-  }
-  function sent() {
-    const [plan, options] = facade.apply.mock.lastCall!;
-    expect(plan).toMatchObject({ origin: 'manual', writes: [{ base: 'absent' }] });
-    const write = plan.writes[0]!;
-    return { ...write, plan, options: { ...options }, ver: versionOf(write) };
-  }
-  const local = { disk, rows, mutation, finish, drafts: () => drafts };
-  return { initial, host, facade, local, open, restart, refresh, sent };
-}
-type Fixture = Awaited<ReturnType<typeof fixture>>;
-
-async function enter(f: Fixture, form: Editor, text = value) {
-  form.input(text);
-  await f.local.finish();
-  return form.view().draftKey!;
-}
-
-async function submit(f: Fixture, form: Editor) {
-  await enter(f, form);
-  await f.local.finish(form.save());
-}
-
-async function observe(f: Fixture, form: Editor) {
-  await f.host.commitAfter(Promise.resolve());
-  await f.local.finish(f.refresh(form));
-  return f.sent();
-}
 
 beforeEach(() => {
   vi.resetModules();
@@ -329,6 +231,100 @@ it.each([false, true])('binds observed bytes before import (read-only %s)', asyn
   expect(f.host.api.triggerSync).not.toHaveBeenCalled();
   expect(f.local.disk(key)).toEqual(marked);
 });
+
+it.each(['update', 'delete'])(
+  'preserves another connection’s %s during read-only observation',
+  async (change) => {
+    const f = await fixture();
+    const form = await f.open();
+    await submit(f, form);
+    const { key } = f.sent();
+    const before = f.local.disk(key)!;
+    const expected = change === 'update' ? { ...before, at: before.at + 1 } : undefined;
+    await f.local.peerMutation(key, expected);
+    await f.host.commitAfter(Promise.resolve());
+    f.host.receiveSync(factKey(7), fact('future', otherKr).replace('"v":2', '"v":3'));
+    await f.local.finish(f.refresh(form));
+    expect(form.view().readOnlyReason).toMatch(/неизвестная версия схемы/i);
+    expect(f.local.disk(key)).toEqual(expected);
+    f.host.receiveImport(f.initial);
+    await f.local.finish(form.retry());
+    expect(f.facade.apply).toHaveBeenCalledOnce();
+    expect(f.host.api.triggerSync).not.toHaveBeenCalled();
+    expect(f.local.disk(key)).toEqual(expected);
+  },
+);
+
+it.each(['retry', 'peer', 'intent', 'edit', 'close', 'revoke', 'leave', 'discard'])(
+  'keeps the observed requirement after a failed mark (%s)',
+  async (mode) => {
+    const f = await fixture();
+    const form = await f.open();
+    await submit(f, form);
+    const { key, ver } = f.sent();
+    const before = f.local.disk(key)!;
+    await f.host.commitAfter(Promise.resolve());
+    const refreshing = f.refresh(form);
+    (await f.local.mutation(key)).exceedQuota();
+    await refreshing;
+    expect(form.view()).toMatchObject({ value, draftMessage: draftError });
+    expect(f.local.disk(key)).toEqual(before);
+    expect(await f.local.drafts().read(key)).toEqual({
+      value: { ...before, baseVer: ver },
+      failed: true,
+    });
+
+    const replacement = { ...before, fields: { ...before.fields, value: 'Новый ввод' } };
+    if (mode === 'peer') await f.local.peerMutation(key, replacement);
+    if (mode === 'intent')
+      f.db.beforeNextReadwrite(() => {
+        f.local.drafts().write(key, replacement);
+      });
+    if (mode === 'close')
+      f.db.beforeNextReadwrite(() => {
+        form.close();
+      });
+    if (mode === 'edit')
+      f.db.beforeNextReadwrite(() => {
+        form.input('Новый ввод');
+      });
+    if (mode === 'revoke') f.host.receiveImport(f.initial);
+    if (mode === 'leave') {
+      form.pause();
+      const leaving = f.local.drafts().flush();
+      (await f.local.mutation(key)).abort();
+      expect(await leaving).toEqual({ ok: false, reason: 'failed', keys: [key] });
+      expect(f.local.disk(key)).toEqual(before);
+      form.pause(false);
+    }
+    const mutations = f.db.mutations.length;
+    const retrying = mode === 'discard' ? form.discard() : form.retry();
+    if (mode === 'retry' || mode === 'leave') {
+      const mark = await f.local.mutation(key);
+      mark.succeedRequest();
+      await tick();
+      expect(f.local.disk(key)).toEqual(before);
+      expect(f.facade.apply).toHaveBeenCalledOnce();
+      expect(f.host.api.triggerSync).not.toHaveBeenCalled();
+      mark.complete();
+      await retrying;
+      expect(f.local.disk(key)).toEqual({ ...before, baseVer: ver });
+      expect(f.sent().options).toMatchObject({ byteCheck: 'require-exact', forceSync: true });
+      expect(f.host.api.triggerSync).toHaveBeenCalledOnce();
+      return;
+    }
+    await f.local.finish(retrying);
+    if (mode === 'discard') {
+      expect(f.db.mutations).toHaveLength(mutations + 1);
+      expect(form.view().draftKey).toBeUndefined();
+    }
+    if (mode === 'intent') expect(f.db.mutations).toHaveLength(mutations + 1);
+    const expected = mode === 'peer' || mode === 'intent' ? replacement : before;
+    expect(f.local.disk(key)).toEqual(mode === 'discard' ? undefined : expected);
+    expect(f.facade.apply).toHaveBeenCalledOnce();
+    expect(f.host.api.triggerSync).not.toHaveBeenCalled();
+  },
+);
 
 it('keeps a visible fact after revocation and discards only the local draft', async () => {
   const f = await fixture();

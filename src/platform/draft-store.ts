@@ -1,11 +1,10 @@
 import { canonicalJson } from '../core/records';
+import { putDraft } from './draft-store-put';
 
 const DATABASE_NAME = 'sp-telos-drafts';
 const STORE_NAME = 'drafts';
 const WIPE_VERSION_KEY = 'meta:last-handled-wipe';
-const BYTE_LIMIT = 1024 * 1024;
 const FLUSH_TIMEOUT_MS = 5000;
-const encoder = new TextEncoder();
 
 export interface Draft {
   readonly fields: Readonly<Record<string, unknown>>;
@@ -19,9 +18,8 @@ export type DraftRead = {
   readonly confirmedRemoval?: Readonly<RemovalOutcome>;
 };
 
-interface RemovalOutcome {
-  state: 'pending' | 'removed' | 'skipped';
-}
+type Outcome<T> = { state: 'pending' | 'skipped' | T };
+type RemovalOutcome = Outcome<'removed'>;
 
 export type FlushResult =
   | { readonly ok: true }
@@ -33,6 +31,12 @@ export interface DraftStore {
   write(key: string, draft: Draft): void;
   remove(key: string): void;
   claim(key: string, draft: Draft): Promise<boolean>;
+  markObserved(
+    key: string,
+    expected: Draft,
+    ver: string,
+    stillCurrent: () => boolean,
+  ): Readonly<Outcome<'updated'>> | undefined;
   removeConfirmed(
     key: string,
     expected: Draft,
@@ -49,17 +53,18 @@ type Value = Draft | string | undefined;
 
 interface Pending {
   readonly value: Value;
-  readonly removal: ConfirmedRemoval | undefined;
+  readonly condition: Condition | undefined;
   failed: boolean;
   running: boolean;
 }
 
-interface ConfirmedRemoval {
+type Condition = (Guard<'removed'> | Guard<'updated'>) & {
   readonly expected: Draft;
-  readonly stillConfirmed: () => boolean;
-  readonly outcome: RemovalOutcome;
+  readonly stillCurrent: () => boolean;
   readonly matchTime: boolean;
-}
+};
+
+type Guard<T> = { readonly success: T; readonly outcome: Outcome<T> };
 
 export function sameDraft(observed: Draft | undefined, expected: Draft): boolean {
   return (
@@ -109,81 +114,51 @@ function isDraft(value: unknown): value is Draft {
   );
 }
 
-function draftBytes(value: unknown): number {
-  // The other stored value is the wipe version, a string outside the draft budget.
-  return value === undefined || typeof value === 'string'
-    ? 0
-    : encoder.encode(JSON.stringify(value)).byteLength;
-}
-
-function putDraft(
-  transaction: IDBTransaction,
-  store: IDBObjectStore,
-  key: string,
-  draft: Draft,
-  canClaim?: () => boolean,
-): void {
-  // Overlapping readwrite transactions on this store run serially, even across connections.
-  const rows: IDBRequest<unknown[]> = store.getAll();
-  const previous: IDBRequest<unknown> = store.get(key);
-  previous.onsuccess = () => {
-    try {
-      if (canClaim && (!canClaim() || previous.result !== undefined)) {
-        transaction.abort();
-        return;
-      }
-      const total = rows.result.reduce<number>((sum, row) => sum + draftBytes(row), 0);
-      if (total - draftBytes(previous.result) + draftBytes(draft) <= BYTE_LIMIT) {
-        if (canClaim) store.add(draft, key);
-        else store.put(draft, key);
-        return;
-      }
-    } catch {
-      // Serialization or a synchronous put error also leaves the intent pending.
-    }
-    transaction.abort();
-  };
-}
-
 function mutate(
   database: IDBDatabase,
   key: string,
-  { value, removal }: Pending,
+  { value, condition }: Pending,
   applicable: () => boolean,
 ): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(STORE_NAME, 'readwrite');
-    let removed = false;
+    let applied = false;
     transaction.oncomplete = () => {
-      resolve(removed);
+      resolve(applied);
     };
     // Failed requests abort the transaction by default.
     transaction.onabort = () => {
       reject(transaction.error ?? new Error('Draft write aborted'));
     };
     const store = transaction.objectStore(STORE_NAME);
-    if (removal) {
-      // A separate connection can commit a new draft before this transaction starts.
+    const matches = (stored: unknown) =>
+      condition !== undefined &&
+      isDraft(stored) &&
+      (condition.matchTime
+        ? stored.at === condition.expected.at &&
+          canonicalJson(stored) === canonicalJson(condition.expected)
+        : sameDraft(stored, condition.expected)) &&
+      applicable();
+    if (value === undefined && condition) {
       const stored: IDBRequest<unknown> = store.get(key);
       stored.onsuccess = () => {
         try {
-          const observed = stored.result;
-          if (
-            !isDraft(observed) ||
-            !sameDraft(observed, removal.expected) ||
-            (removal.matchTime && canonicalJson(observed) !== canonicalJson(removal.expected)) ||
-            !applicable()
-          )
-            return;
+          if (!matches(stored.result)) return;
           store.delete(key);
-          removed = true;
+          applied = true;
         } catch {
           transaction.abort();
         }
       };
     } else if (value === undefined) store.delete(key);
     else if (typeof value === 'string') store.put(value, key);
-    else putDraft(transaction, store, key, value);
+    else
+      putDraft(transaction, store, key, value, {
+        replace(stored) {
+          applied = !condition || matches(stored);
+          return applied;
+        },
+      });
   });
 }
 
@@ -226,19 +201,19 @@ export function createDraftStore(factory?: Factory): DraftStore {
 
   async function persist(key: string, attempted: Pending): Promise<void> {
     attempted.running = true;
-    const { removal } = attempted;
-    const applicable = () => pending.get(key) === attempted && removal?.stillConfirmed() === true;
+    const { condition } = attempted;
+    const applicable = () => pending.get(key) === attempted && condition?.stillCurrent() === true;
     try {
       const connected = await database();
       // Opening the database can outlast both the confirmation and a flush deadline.
-      const removed =
-        (!removal || applicable()) && (await mutate(connected, key, attempted, applicable));
-      if (removal) removal.outcome.state = removed ? 'removed' : 'skipped';
+      const applied =
+        (!condition || applicable()) && (await mutate(connected, key, attempted, applicable));
+      if (condition) condition.outcome.state = applied ? condition.success : 'skipped';
     } catch {
       const latest = pending.get(key);
-      const revoked = latest === attempted && removal?.stillConfirmed() === false;
-      if (removal && (revoked || latest !== attempted)) {
-        removal.outcome.state = 'skipped';
+      const revoked = latest === attempted && condition?.stillCurrent() === false;
+      if (condition && (revoked || latest !== attempted)) {
+        condition.outcome.state = 'skipped';
       }
       if (revoked) pending.delete(key);
       else if (latest) {
@@ -259,12 +234,12 @@ export function createDraftStore(factory?: Factory): DraftStore {
     checkFlush?.();
   }
 
-  function enqueue(key: string, value: Value, removal?: ConfirmedRemoval): void {
+  function enqueue(key: string, value: Value, condition?: Condition): void {
     const previous = pending.get(key);
-    if (previous?.removal && !previous.running) previous.removal.outcome.state = 'skipped';
+    if (previous?.condition && !previous.running) previous.condition.outcome.state = 'skipped';
     const intent = {
       value,
-      removal,
+      condition,
       failed: previous?.failed ?? false,
       running: previous?.running ?? false,
     };
@@ -308,7 +283,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
 
   function visibleIntent(key: string): Pending | undefined {
     const intent = pending.get(key);
-    return intent?.removal?.stillConfirmed() === false ? undefined : intent;
+    return intent?.condition?.stillCurrent() === false ? undefined : intent;
   }
 
   function readIntent(intent: Pending | undefined, failed = intent?.failed ?? false): DraftRead {
@@ -316,7 +291,9 @@ export function createDraftStore(factory?: Factory): DraftStore {
     return {
       value: isDraft(value) ? structuredClone(value) : undefined,
       failed,
-      ...(intent?.removal && { confirmedRemoval: intent.removal.outcome }),
+      ...(intent?.condition?.success === 'removed' && {
+        confirmedRemoval: intent.condition.outcome,
+      }),
     };
   }
 
@@ -350,7 +327,7 @@ export function createDraftStore(factory?: Factory): DraftStore {
         keys.filter((key): key is string => typeof key === 'string' && key !== WIPE_VERSION_KEY),
       );
       for (const [key, intent] of pending) {
-        if (key === WIPE_VERSION_KEY || intent.removal?.stillConfirmed() === false) continue;
+        if (key === WIPE_VERSION_KEY || intent.condition?.stillCurrent() === false) continue;
         if (intent.value === undefined) drafts.delete(key);
         else drafts.add(key);
       }
@@ -375,11 +352,29 @@ export function createDraftStore(factory?: Factory): DraftStore {
         claims.delete(key);
       }
     },
-    removeConfirmed(key, expected, stillConfirmed, matchTime = false) {
+    markObserved(key, expected, ver, stillCurrent) {
+      if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
+      if (pending.has(key)) return undefined;
+      const outcome: Outcome<'updated'> = { state: 'pending' };
+      const original = structuredClone(expected);
+      enqueue(
+        key,
+        { ...original, baseVer: ver },
+        {
+          expected: original,
+          stillCurrent,
+          outcome,
+          success: 'updated',
+          matchTime: true,
+        },
+      );
+      return outcome;
+    },
+    removeConfirmed(key, expected, stillCurrent, matchTime = false) {
       if (key === WIPE_VERSION_KEY) throw new Error('Reserved draft key');
       if (pending.has(key)) return undefined;
       const outcome: RemovalOutcome = { state: 'pending' };
-      enqueue(key, undefined, { expected, stillConfirmed, outcome, matchTime });
+      enqueue(key, undefined, { expected, stillCurrent, outcome, matchTime, success: 'removed' });
       return outcome;
     },
     async readWipeVersion() {
@@ -430,7 +425,9 @@ function claimDraft(
         transaction.onabort = () => {
           finish(false);
         };
-        putDraft(transaction, transaction.objectStore(STORE_NAME), key, draft, applicable);
+        putDraft(transaction, transaction.objectStore(STORE_NAME), key, draft, {
+          claim: applicable,
+        });
       })
       .catch(() => {
         finish(false);
