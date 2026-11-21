@@ -248,6 +248,7 @@ function View() {
     void load(true);
     const draftWatch = setInterval(() => {
       void editor.checkDraft();
+      void measurements.checkDraft();
     }, 500);
     return () => {
       active = false;

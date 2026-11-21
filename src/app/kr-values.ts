@@ -1,11 +1,5 @@
 import { buildPlan, EMPTY_STATE, isPlan, type Plan } from '../core/plan';
-import {
-  decodeRecord,
-  isRecordKeyOfKind,
-  isUuid,
-  KR_VALUE_PREFIX,
-  WIPE_KEY,
-} from '../core/records';
+import * as records from '../core/records';
 import { sameDraft, type Draft, type DraftStore } from '../platform/draft-store';
 import { handoffGoalPlan, removeConfirmedDraft, type ReadSnapshot } from '../platform/facade';
 import {
@@ -14,14 +8,14 @@ import {
   krValueWrite,
   recordAt,
   removalMessages,
-  type GoalEditorDependencies,
+  type GoalEditorDependencies as EditorDeps,
   type ApplyOptions,
 } from './commands';
 import { pendingWipe } from './linked-editor-intent';
 import { createSaveStatus, saveMessage, type SaveStatus } from './save-status';
 
 const action = 'record-kr-value';
-const cleared = { input: undefined, rejected: false, error: undefined };
+const cleared = { input: undefined, rejected: false, error: undefined, receipt: undefined };
 export const unconfirmed = 'Сохранение не подтверждено';
 export const unconfirmedMessage = `${unconfirmed} · Повторить`;
 
@@ -35,21 +29,21 @@ interface Input {
 }
 
 function readFact(key: string, raw: string) {
-  const decoded = decodeRecord(key, raw);
+  const decoded = records.decodeRecord(key, raw);
   return decoded.ok && 'kind' in decoded.value && decoded.value.kind === 'kr-value'
     ? { ...decoded.value, key }
     : undefined;
 }
 
 function readDraft(key: string, draft?: Draft): Input | undefined {
-  if (!draft || !isRecordKeyOfKind(key, 'kr-value')) return undefined;
+  if (!draft || !records.isRecordKeyOfKind(key, 'kr-value')) return undefined;
   const { krKey, value, expectedWipe, plan } = draft.fields;
   if (
     draft.fields.action !== action ||
     typeof krKey !== 'string' ||
-    !isRecordKeyOfKind(krKey, 'kr') ||
+    !records.isRecordKeyOfKind(krKey, 'kr') ||
     typeof value !== 'string' ||
-    (expectedWipe !== absent && !isUuid(expectedWipe))
+    (expectedWipe !== absent && !records.isUuid(expectedWipe))
   )
     return undefined;
   const input = { key, krKey, value, expectedWipe, draft };
@@ -62,17 +56,14 @@ function readDraft(key: string, draft?: Draft): Input | undefined {
 }
 
 export async function listKrValueDrafts(drafts: DraftStore, keys: readonly string[]) {
-  const measurementKeys = keys.filter((key) => key.startsWith(KR_VALUE_PREFIX));
+  const read = async (key: string) => readDraft(key, (await drafts.read(key)).value);
   const rows = await Promise.all(
-    measurementKeys.map(async (key) => readDraft(key, (await drafts.read(key)).value)),
+    keys.filter((key) => key.startsWith(records.KR_VALUE_PREFIX)).map(read),
   );
   return rows.filter((item) => item !== undefined).sort((a, b) => b.draft.at - a.draft.at);
 }
 
-type Dependencies = Pick<
-  GoalEditorDependencies,
-  'facade' | 'drafts' | 'now' | 'newId' | 'onChange'
->;
+type Dependencies = Pick<EditorDeps, 'facade' | 'drafts' | 'now' | 'newId' | 'onChange'>;
 
 interface Card {
   readonly key: string;
@@ -83,6 +74,7 @@ interface Card {
   message?: string | undefined;
   draftMessage?: string | undefined;
   wipe?: Awaited<ReturnType<typeof pendingWipe>>;
+  confirmed?: Plan['writes'][number] | undefined;
   receipt?: SaveStatus['state'] | undefined;
   saving?: Input | undefined;
   marking?: Promise<void> | undefined;
@@ -96,22 +88,24 @@ function live(card: Card): boolean {
 }
 
 function wipeVersion(snapshot?: ReadSnapshot): string | undefined {
+  const { WIPE_KEY } = records;
   if (!snapshot || snapshot.unreadKeys?.includes(WIPE_KEY)) return undefined;
   return snapshot.entries[WIPE_KEY] === undefined ? absent : recordAt(snapshot, WIPE_KEY)?.ver;
 }
 
-function exact(card: Card, input: Input): boolean {
-  return input.sent !== undefined && card.snapshot?.entries[input.key] === input.sent.write.value;
+function exact(card: Card, write?: Plan['writes'][number]): boolean {
+  return write !== undefined && card.snapshot?.entries[write.key] === write.value;
 }
 
-function readOnly(card: Card): string | undefined {
+function snapshotIssue(card: Card): string | undefined {
   const { snapshot, input } = card;
   if (!snapshot) return undefined;
-  if (snapshot.readOnlyReason) return snapshot.readOnlyReason;
   if (wipeVersion(snapshot) === undefined) return 'Не удалось прочитать маркер очистки.';
   if (input && snapshot.unreadKeys?.includes(input.key)) return 'Не удалось прочитать измерение.';
   return live(card) ? undefined : 'Ключевой результат удалён или недоступен.';
 }
+
+const readOnly = (card: Card) => card.snapshot?.readOnlyReason || snapshotIssue(card);
 
 function conflict(card: Card): boolean {
   const { input, snapshot } = card;
@@ -120,7 +114,7 @@ function conflict(card: Card): boolean {
   return (
     card.rejected === true ||
     (wipe !== undefined && wipe !== input.expectedWipe) ||
-    (snapshot.entries[input.key] !== undefined && !exact(card, input))
+    (snapshot.entries[input.key] !== undefined && !exact(card, input.sent?.write))
   );
 }
 
@@ -132,42 +126,46 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
   const selected = (target: Card) => card === target && !target.paused;
   const current = (target: Card, input: Input | undefined) =>
     selected(target) && target.input === input;
-  const writable = (target: Card) =>
-    target.snapshot !== undefined && !readOnly(target) && !target.wipe && !conflict(target);
+  const consistent = (target: Card) =>
+    target.snapshot !== undefined && !snapshotIssue(target) && !target.wipe && !conflict(target);
+  const writable = (target: Card) => !target.snapshot?.readOnlyReason && consistent(target);
   const idle = (target: Card) =>
     selected(target) && !target.saving && !target.marking && !target.removing;
   async function sameLocal(input: Input): Promise<boolean> {
-    const local = await drafts.read(input.key);
-    return (
-      !local.failed && local.value?.at === input.draft.at && sameDraft(local.value, input.draft)
-    );
+    const { failed, value } = await drafts.read(input.key);
+    return !failed && value?.at === input.draft.at && sameDraft(value, input.draft);
   }
   const status = createSaveStatus({
     now,
     readSaveState: (keys) => facade.readSaveState(keys),
     async read(keys) {
-      const refresh = beginRefresh();
-      const snapshot = await facade.read([...keys, card.key]);
-      await refresh(snapshot);
-      const { input } = card;
-      const blocked = card.draftMessage === draftError || snapshot.readOnlyReason;
-      if (!input?.sent || blocked || !exact(card, input)) return EMPTY_STATE;
-      return snapshot.entries[input.key] === input.sent.write.value ? snapshot : EMPTY_STATE;
+      const target = card;
+      await beginRefresh()(await facade.read([...keys, target.key]));
+      // A newer refresh can finish while the poll is reading its snapshot.
+      const write = target.confirmed ?? target.input?.sent?.write;
+      if (target.draftMessage === draftError || !exact(target, write)) return EMPTY_STATE;
+      return target.snapshot ?? EMPTY_STATE;
     },
     onStatus(next) {
       const target = card;
-      const input = target.input;
-      if (!input || !selected(target)) return;
-      target.receipt = next.state;
-      target.message = measurementStatus(next, exact(target, input));
+      const { input, confirmed } = target;
+      if (!selected(target)) return;
+      const visible = exact(target, confirmed ?? input?.sent?.write);
+      const result = next.state === 'saved' && !visible ? ({ state: 'replaced' } as const) : next;
+      if (confirmed) target.message = result.state === 'saved' ? saveMessage(result) : undefined;
+      else if (input) {
+        target.receipt = result.state;
+        target.message = measurementStatus(result, visible);
+        if (result.state === 'saved') void remove(target, input, true);
+      }
       changed();
-      if (next.state === 'saved') void remove(target, input, true);
     },
   });
 
   function stop(target: Card): void {
     status.close(target.key);
-    target.receipt = undefined;
+    if (target.receipt || target.confirmed) target.message = undefined;
+    target.receipt = target.confirmed = undefined;
   }
 
   async function track(target: Card, input: Input): Promise<void> {
@@ -182,13 +180,14 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
     target.removing = true;
     const applicable = () =>
       current(target, input) &&
-      (!confirmed || (target.receipt === 'saved' && writable(target) && exact(target, input)));
+      (!confirmed ||
+        (target.receipt === 'saved' && writable(target) && exact(target, input.sent?.write)));
     try {
       const result = await removeConfirmedDraft(drafts, input.key, input.draft, applicable);
       if (!applicable()) return;
       target.draftMessage = result ? removalMessages[result] : undefined;
       if (result !== 'removed') return;
-      stop(target);
+      target.confirmed = confirmed ? input.sent?.write : undefined;
       Object.assign(target, cleared);
       if (!confirmed) target.message = undefined;
     } finally {
@@ -199,7 +198,8 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
 
   async function observe(target: Card, input: Input): Promise<void> {
     const ver = input.sent?.ver;
-    const applicable = () => current(target, input) && exact(target, input) && writable(target);
+    const applicable = () =>
+      current(target, input) && exact(target, input.sent?.write) && consistent(target);
     if (!ver || input.draft.baseVer === ver || !applicable() || !(await sameLocal(input))) return;
     if (!applicable() || input.draft.baseVer === ver) return;
     // Keep the observation in memory across a flush failure. Retry must still flush it before handoff.
@@ -223,12 +223,9 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       const wipe = await pendingWipe(drafts, snapshot);
       if (!latest()) return;
       displayed = number;
-      target.snapshot = snapshot;
-      target.wipe = wipe;
-      if (!writable(target)) {
-        if (target.receipt) target.message = undefined;
-        stop(target);
-      }
+      Object.assign(target, { snapshot, wipe });
+      if (!writable(target)) stop(target);
+      else if (target.confirmed && !exact(target, target.confirmed)) target.message = undefined;
       changed();
       if (!input) return;
       await observe(target, input);
@@ -239,10 +236,15 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
 
   const keysFor = ({ input, key }: Card) => (input ? [key, input.key] : [key]);
 
+  function select(key: string): void {
+    stop(card);
+    card = { key };
+    changed();
+  }
+
   async function open(key: string, draftKey?: string): Promise<void> {
-    pause();
-    const target: Card = { key };
-    card = target;
+    select(key);
+    const target = card;
     const listed = draftKey ? { keys: [draftKey], failed: false } : await drafts.list();
     const inputs = await listKrValueDrafts(drafts, listed.keys);
     if (!selected(target)) return;
@@ -262,28 +264,18 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
     changed();
   }
 
-  function close(): void {
-    pause();
-    card = { key: '' };
-    changed();
-  }
-
   function input(value: string): void {
     const target = card;
     if (!selected(target) || !writable(target)) return;
     stop(target);
     const previous = target.input;
-    const key =
-      previous && !previous.sent && !target.removing ? previous.key : KR_VALUE_PREFIX + newId();
-    const krKey = target.key;
+    const reuseKey = previous && !previous.sent && !target.removing;
+    const key = reuseKey ? previous.key : records.KR_VALUE_PREFIX + newId();
     const expectedWipe = wipeVersion(target.snapshot) ?? absent;
-    const fields = { krKey, value, expectedWipe, action };
+    const fields = { krKey: target.key, value, expectedWipe, action };
     const draft = { fields, baseVer: absent, at: now() };
     target.input = { key, ...fields, draft };
-    target.error = undefined;
-    target.message = undefined;
-    target.draftMessage = undefined;
-    target.saving = undefined;
+    target.error = target.message = target.draftMessage = target.saving = undefined;
     drafts.write(key, draft);
     changed();
   }
@@ -299,9 +291,8 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
 
   async function submit(retry: boolean, source?: Input): Promise<void> {
     const target = card;
-    if (!idle(target) || !writable(target)) return;
     const initial = target.input;
-    if (initial?.sent && !retry) return;
+    if (!idle(target) || !writable(target) || (initial?.sent && !retry)) return;
     const attempt = prepare(initial);
     if (!attempt) {
       target.error = initial?.value.trim()
@@ -320,8 +311,7 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
       const settled = await drafts.flush();
       if (!current(target, attempt)) return;
       target.draftMessage = settled.ok ? undefined : draftError;
-      if (!settled.ok || !applicable()) return;
-      if (!(await sameLocal(attempt)) || !applicable()) return;
+      if (!settled.ok || !applicable() || !(await sameLocal(attempt)) || !applicable()) return;
       if (source) await removeConfirmedDraft(drafts, source.key, source.draft, applicable);
       if (applicable()) await handoff(target, attempt, retry);
     } catch {
@@ -354,7 +344,7 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
     if (result.refreshed) {
       await refreshFailure(result.refreshed);
       if (!current(target, input)) return;
-      if (!result.applied && options.byteCheck === 'require-exact' && !exact(target, input))
+      if (!result.applied && options.byteCheck === 'require-exact' && !exact(target, sent.write))
         target.rejected = true;
     }
     await track(target, input);
@@ -368,10 +358,22 @@ export function createKrValueEditor({ facade, drafts, now, newId, onChange }: De
 
   return {
     open,
-    close,
+    close() {
+      select('');
+    },
     pause,
     beginRefresh,
     input,
+    async checkDraft() {
+      const target = card;
+      const { input } = target;
+      const checking = () => idle(target) && !target.draftMessage;
+      if (!input || input.sent || !checking()) return;
+      const { failed } = await drafts.read(input.key);
+      if (!failed || !current(target, input) || !checking()) return;
+      target.draftMessage = draftError;
+      changed();
+    },
     save: () => submit(false),
     retry: () => submit(true),
     async discard() {
@@ -416,7 +418,7 @@ function measurements(card: Card) {
   if (!live(card)) return [];
   return Object.entries(card.snapshot?.entries ?? {})
     .flatMap(([key, raw]) => {
-      if (!key.startsWith(KR_VALUE_PREFIX)) return [];
+      if (!key.startsWith(records.KR_VALUE_PREFIX)) return [];
       const fact = readFact(key, raw);
       return fact?.krKey === card.key ? [fact] : [];
     })
