@@ -282,27 +282,35 @@ function readFactOperationIds(prefix: string) {
       reject(open.error ?? new Error('Could not open the operation journal'));
     };
     open.onsuccess = () => {
-      const db = open.result;
-      const tx = db.transaction('ops', 'readonly');
+      const tx = open.result.transaction('ops', 'readonly');
       const read = tx.objectStore('ops').getAll();
+      // Closing the connection lets this active read transaction finish.
+      open.result.close();
       tx.onabort = () => {
-        db.close();
         reject(tx.error ?? new Error('Could not read the operation journal'));
       };
       tx.oncomplete = () => {
-        db.close();
-        const rows = read.result as Row[];
-        resolve(rows.filter(isFact).map(({ op }) => op.id));
+        resolve((read.result as Row[]).filter(isFact).map(({ op }) => op.id));
       };
     };
   });
 }
 
-async function waitForUnconfirmed(profile: StandProfile) {
-  await expect(profile.frame.getByText(unconfirmed, { exact: true })).toBeVisible({
-    timeout: 35_000,
-  });
-  await expect(button(profile.frame, 'Повторить')).toBeEnabled();
+async function waitForUnconfirmed({ frame }: StandProfile) {
+  await expect(frame.getByText(unconfirmed, { exact: true })).toBeVisible({ timeout: 35_000 });
+  await expect(button(frame, 'Повторить')).toBeEnabled();
+}
+
+async function handleImportConflict({ page }: StandProfile) {
+  const dialog = page.locator('mat-dialog-container:not(.mdc-dialog--closing):visible').last();
+  const cancel = async (active: typeof dialog) => {
+    const hosts = active.locator('.mat-mdc-dialog-component-host');
+    const tags = await hosts.evaluateAll((elements) => elements.map((el) => el.localName));
+    expect(tags, 'Unexpected host dialog').toEqual(['dialog-sync-import-conflict']);
+    const actions = active.locator('dialog-sync-import-conflict mat-dialog-actions');
+    await actions.getByRole('button', { name: 'Cancel', exact: true }).click({ timeout: 8_000 });
+  };
+  await page.addLocatorHandler(dialog, cancel, { noWaitAfter: true });
 }
 
 test('Keep a visible measurement unconfirmed when its receipt is unavailable', async ({
@@ -333,30 +341,25 @@ test('Keep a visible measurement unconfirmed when its receipt is unavailable', a
       }
     });
 
+  const factStatus = async () => (await status(form(a), [write.key])).keys[write.key];
   await test.step('Deliver the exact operation and revoke its receipt by importing the same backup', async () => {
     await sync(form(a));
     await uploads.accepted(operation);
     await pull(b, write.key, write.value);
     await expectFacts(b, [write]);
-    await expect
-      .poll(async () => (await status(form(a), [write.key])).keys[write.key])
-      .toEqual(receipt(write.value));
+    await expect.poll(factStatus).toEqual(receipt(write.value));
     expect(await draft(form(a), write.key)).toBeDefined();
     const oldId = await deviceId(a.page);
     expect(oldId).toBe(operation.clientId);
     await a.page.goto(new URL('/#/config', a.page.url()).href);
     await exportAndImport(a.page);
-    await expect
-      .poll(async () => {
-        const id = await deviceId(a.page);
-        return Boolean(id && id !== oldId);
-      })
-      .toBe(true);
+    await expect.poll(async () => (await deviceId(a.page)) || oldId).not.toBe(oldId);
     await reopen(stand, a);
     await expectBytes(a, [kr, write]);
-    expect((await status(form(a), [write.key])).keys[write.key]).toEqual({ state: 'unknown' });
+    expect(await factStatus()).toEqual({ state: 'unknown' });
   });
 
+  await handleImportConflict(a);
   await openClosedKr(a);
   await expectFacts(a, [write]);
   await waitForUnconfirmed(a);
@@ -369,7 +372,7 @@ test('Keep a visible measurement unconfirmed when its receipt is unavailable', a
 
   await test.step('Retry the same plan, with a real zero-write reply and the draft still present', async () => {
     await expect.poll(async () => (await draft(form(a), write.key))?.baseVer).toBe(verOf(write));
-    await button(a.frame, 'Повторить').click();
+    await button(a.frame, 'Повторить').click({ timeout: 10_000 });
     await expect.poll(async () => (await retryLog.jsonValue()).requests.length).toBe(1);
     const { id, command } = (await retryLog.jsonValue()).requests[0]!;
     expect(command).toMatchObject({
@@ -378,15 +381,14 @@ test('Keep a visible measurement unconfirmed when its receipt is unavailable', a
       byteCheck: 'require-exact',
       expectedWipe: 'absent',
     });
-    await expect
-      .poll(async () => (await retryLog.jsonValue()).replies.find((reply) => reply.id === id))
-      .toEqual({
-        id,
-        type: 'PLUGIN_MESSAGE_RESPONSE',
-        result: { total: 1, transferred: 0, writes: [write] },
-      });
+    const reply = async () => (await retryLog.jsonValue()).replies.find((item) => item.id === id);
+    await expect.poll(reply).toEqual({
+      id,
+      type: 'PLUGIN_MESSAGE_RESPONSE',
+      result: { total: 1, transferred: 0, writes: [write] },
+    });
     await waitForUnconfirmed(a);
-    expect((await status(form(a), [write.key])).keys[write.key]).toEqual({ state: 'unknown' });
+    expect(await factStatus()).toEqual({ state: 'unknown' });
     await expect(input(a)).toHaveValue(observation);
     expect(await draft(form(a), write.key)).toBeDefined();
     await expectFacts(a, [write]);
@@ -396,7 +398,7 @@ test('Keep a visible measurement unconfirmed when its receipt is unavailable', a
   await test.step('Explicit removal waits for local deletion and keeps the fact and the other draft', async () => {
     const deletion = await pauseDraft(form(a), write.key, 'delete');
     try {
-      await button(a.frame, removeInput).click();
+      await button(a.frame, removeInput).click({ timeout: 10_000 });
       await deletion.entered();
       expect((await deletion.read()).outcome).toBe('');
       await expect(input(a)).toHaveValue(observation);
